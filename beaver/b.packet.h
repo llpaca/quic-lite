@@ -4,8 +4,16 @@
 #include <stddef.h>
 #include <string.h>
 #include <arpa/inet.h>
-
 #include "misc/util.h"
+/// On-wire packet layout, checksum, and serialisation helpers.
+/// Wire format (13-byte header + up to 1024 bytes of payload):
+///
+///   0       4       8  9      11     13
+///   +-------+-------+--+------+------+
+///   |  seq  |  ack  |fl| len  | cks  |
+///   +-------+-------+--+------+------+
+///   |            payload ...          |
+///   +---------------------------------+
 
 #define MAX_PAYLOAD 1024
 #define HDR_SIZE    13
@@ -16,7 +24,7 @@
 #define RST  (1 << 3)   // 00001000  hard reset / error
 
 typedef struct header {
-    u32     seq;        // byte offset of this chunk in the full stream
+    u32     seq;        // byte offset of this chunk in the full stream <- this point is for me
     u32     ack;
     uint8_t flags;
     u16     len;
