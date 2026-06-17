@@ -565,6 +565,13 @@ typedef struct {
 /**
  * PUBLIC API
  */
+
+int  ql_udp_socket(const char *bind_addr, uint16_t port);
+int  ql_udp_send(int fd, const struct sockaddr *addr, socklen_t addrlen,
+                  const uint8_t *buf, size_t len);
+int  ql_udp_recv(int fd, uint8_t *buf, size_t cap,
+                  struct sockaddr_storage *src, socklen_t *srclen);
+
 int  ql_frame_encode(const ql_frame_t *frame, uint8_t *buf, size_t cap);
 int  ql_frame_decode(const uint8_t *buf, size_t len, ql_frame_t *out);
 
