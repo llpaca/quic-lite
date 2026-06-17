@@ -46,7 +46,7 @@ typedef uint64_t ql_pkt_num_t;
 #define QL_CID_MAX_LEN  20
 typedef struct {
     uint8_t  data[QL_CID_MAX_LEN];
-    uint8_t  len;                    /* 0 = zero-length (§5.1) */
+    uint8_t  len;                    /* 0 = zero-length (5.1) */
 } ql_cid_t;
 
 /* Stateless Reset Token 10.3.2 — exactly 16 bytes */
@@ -180,7 +180,7 @@ typedef struct {
     uint64_t       range_count;        /* additional ACK range pairs */
     uint64_t       first_ack_range;    /* acked packets below largest_acked */
     ql_ack_range_t ranges[QL_ACK_RANGE_MAX];
-    /* §19.3.2 — ECN counts, present only in ACK_ECN frame */
+    /* 19.3.2 — ECN counts, present only in ACK_ECN frame */
     uint64_t  ect0_count;
     uint64_t  ect1_count;
     uint64_t  ecn_ce_count;
@@ -371,7 +371,7 @@ typedef struct {
     that uses QUIC.
 */
 typedef struct {
-    ql_transport_error_t  error_code;      /* transport close: §20.1 code */
+    ql_transport_error_t  error_code;      /* transport close: 20.1 code */
     ql_app_error_t        app_error_code;  /* app close: opaque error code */
     ql_frame_type_t       frame_type;      /* causal frame type (0x1C only) */
     uint64_t              reason_length;
@@ -415,6 +415,63 @@ typedef struct {
         ql_frame_handshake_done_t       handshake_done;
     } u;
 } ql_frame_t;
+
+/**
+ * @link: https://www.rfc-editor.org/rfc/rfc9000.html?#name-packet-formats
+ */
+/* Long header (Initial, 0-RTT, Handshake, Retry) 17.2 */
+/*
+    Long headers are used for packets that are sent prior to the 
+    establishment of 1-RTT keys. Once 1-RTT keys are available, 
+    a sender switches to sending packets using the short header
+*/
+typedef struct {
+    ql_pkt_type_t  pkt_type;
+    uint8_t        first_byte;
+    uint32_t       version;
+    ql_cid_t       dst_cid;
+    ql_cid_t       src_cid;
+    /* Initial only 17.2.2 */
+    uint8_t        token[QL_TOKEN_MAX_LEN];
+    size_t         token_len;
+    /* Retry only 17.2.5 — AES-128-GCM tag, 16 bytes */
+    uint8_t        retry_integrity_tag[QL_AEAD_TAG_LEN];
+    bool           is_retry;
+    /* Present in Initial, 0-RTT, Handshake (not Retry, not VN) */
+    uint64_t       length;       /* payload length varint */
+    ql_pkt_num_t   pkt_num;      /* decoded full packet number */
+    uint8_t        pkt_num_len;  /* encoded width: 1–4 bytes */
+} ql_long_hdr_t;
+
+/* Short (1-RTT) header 17.3.1 */
+typedef struct {
+    uint8_t       first_byte;
+    ql_cid_t      dst_cid;
+    ql_pkt_num_t  pkt_num;
+    uint8_t       pkt_num_len;
+    bool          spin_bit;   /* 17.4 */
+    bool          key_phase;  /* RFC 9001 5.4 */
+} ql_short_hdr_t;
+
+/* Unified view after parsing */
+typedef struct {
+    bool  is_long;
+    union {
+        ql_long_hdr_t   lhdr;
+        ql_short_hdr_t  shdr;
+    } h;
+    /* Decrypted payload slice within the datagram buffer (AEAD tag removed) */
+    const uint8_t  *payload;
+    size_t          payload_len;
+} ql_pkt_hdr_t;
+
+/* 17.2.1 — Version Negotiation Packet */
+typedef struct {
+    ql_cid_t  dst_cid;
+    ql_cid_t  src_cid;
+    uint32_t  versions[QL_MAX_VERSIONS];
+    int       version_count;
+} ql_ver_neg_pkt_t;
 
 /**
  * PUBLIC API
