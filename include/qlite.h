@@ -422,6 +422,11 @@ typedef struct {
 int  ql_frame_encode(const ql_frame_t *frame, uint8_t *buf, size_t cap);
 int  ql_frame_decode(const uint8_t *buf, size_t len, ql_frame_t *out);
 
+int  ql_pkt_encode(const ql_pkt_hdr_t *hdr, const ql_keys_t *key,
+                    const uint8_t *payload, size_t payload_len,
+                    uint8_t *out, size_t cap);
+int  ql_pkt_decode(const uint8_t *buf, size_t len, const ql_keys_t *key,
+                    ql_pkt_hdr_t *hdr_out, uint8_t *payload_out, size_t cap);
 
 #if defined(__cplusplus)
 } /* extern "C" */
