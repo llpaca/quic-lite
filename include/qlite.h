@@ -36,6 +36,76 @@ extern "C" {
 #include <unistd.h>
 #include <fcntl.h>
 
+/* Stream ID 2.1 — 62-bit, lower 2 bits encode initiator + direction */
+typedef uint64_t ql_stream_id_t;
+
+/* Packet number 12.3 — 62-bit per-packet-number-space counter */
+typedef uint64_t ql_pkt_num_t;
+
+/* Connection ID 5.1 — opaque, 1–20 bytes; len=0 means zero-length CID */
+#define QL_CID_MAX_LEN  20
+typedef struct {
+    uint8_t  data[QL_CID_MAX_LEN];
+    uint8_t  len;                    /* 0 = zero-length (§5.1) */
+} ql_cid_t;
+
+/* Stateless Reset Token 10.3.2 — exactly 16 bytes */
+#define QL_RESET_TOKEN_LEN  16
+typedef struct {
+    uint8_t  data[QL_RESET_TOKEN_LEN];
+} ql_reset_token_t;
+
+/* Path validation data 19.17–19.18 — exactly 8 bytes */
+#define QL_PATH_DATA_LEN  8
+typedef struct {
+    uint8_t  data[QL_PATH_DATA_LEN];
+} ql_path_data_t;
+
+/*
+ * One contiguous ACK range: acknowledges all packets in
+ * [largest − (count − 1), largest].
+ */
+typedef struct {
+    ql_pkt_num_t  largest;
+    uint64_t      count;    /* number of contiguous packet numbers */
+} ql_ack_range_t;
+
+/* 13.2 — ACK tracking */
+#define QL_ACK_RANGE_MAX        64    /* max ACK ranges we track in one frame */
+#define QL_ACK_DELAY_THRESHOLD  2     /* send ACK after this many ack-eliciting pkts */
+#define QL_ACK_TIMEOUT_MS      25     /* max ACK delay when not in threshold path */
+
+/* 
+ * Transport ERR codes  20.1
+ */
+typedef enum {
+    QL_ERR_NO_ERROR                  = 0x00,
+    QL_ERR_INTERNAL_ERROR            = 0x01,
+    QL_ERR_CONNECTION_REFUSED        = 0x02,
+    QL_ERR_FLOW_CONTROL_ERROR        = 0x03,
+    QL_ERR_STREAM_LIMIT_ERROR        = 0x04,
+    QL_ERR_STREAM_STATE_ERROR        = 0x05,
+    QL_ERR_FINAL_SIZE_ERROR          = 0x06,
+    QL_ERR_FRAME_ENCODING_ERROR      = 0x07,
+    QL_ERR_TRANSPORT_PARAMETER_ERROR = 0x08,
+    QL_ERR_CONNECTION_ID_LIMIT_ERROR = 0x09,
+    QL_ERR_PROTOCOL_VIOLATION        = 0x0A,
+    QL_ERR_INVALID_TOKEN             = 0x0B,
+    QL_ERR_APPLICATION_ERROR         = 0x0C,
+    QL_ERR_CRYPTO_BUFFER_EXCEEDED    = 0x0D,
+    QL_ERR_KEY_UPDATE_ERROR          = 0x0E,
+    QL_ERR_AEAD_LIMIT_REACHED        = 0x0F,
+    QL_ERR_NO_VIABLE_PATH            = 0x10,
+    /*
+     * 20.1 — TLS alert codes 6 RFC 9001.
+     * CRYPTO_ERROR base: 0x0100 + TLS alert value.
+     */
+    QL_ERR_CRYPTO_ERROR_BASE         = 0x0100,
+} ql_transport_error_t;
+
+/* Application-protocol error codes 20.2 — opaque 62-bit integer */
+typedef uint64_t ql_app_error_t;
+
 /**
  * @link: https://www.rfc-editor.org/rfc/rfc9000.html?#name-frame-types-and-formats
  */
