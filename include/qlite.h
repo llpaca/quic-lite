@@ -70,10 +70,56 @@ typedef struct {
     uint64_t      count;    /* number of contiguous packet numbers */
 } ql_ack_range_t;
 
+/* 15 — QUIC version identifiers */
+#define QL_VERSION_1              UINT32_C(0x00000001)  /* QUIC v1 */
+#define QL_VERSION_NEGOTIATION    UINT32_C(0x00000000)  /* Version Negotiation 17.2.1 */
+#define QL_VERSION_RESERVED_MASK  UINT32_C(0x0A0A0A0A)  /* 6.3 force version-neg */
+
 /* 13.2 — ACK tracking */
 #define QL_ACK_RANGE_MAX        64    /* max ACK ranges we track in one frame */
 #define QL_ACK_DELAY_THRESHOLD  2     /* send ACK after this many ack-eliciting pkts */
 #define QL_ACK_TIMEOUT_MS      25     /* max ACK delay when not in threshold path */
+
+/* Key material sizes (RFC 9001) */
+#define QL_AEAD_KEY_MAX_LEN   32   /* AES-256-GCM key */
+#define QL_AEAD_IV_MAX_LEN    12   /* AEAD nonce / IV */
+#define QL_HP_KEY_MAX_LEN     32   /* header-protection key */
+#define QL_SECRET_MAX_LEN     48   /* HKDF secret (SHA-384 output size) */
+
+/* 12.1 / RFC 9001 5.3 — AEAD tag is always 16 bytes */
+#define QL_AEAD_TAG_LEN  16
+
+/* Server limits */
+#define QL_SERVER_MAX_CONNS    1024
+#define QL_MAX_CIDS            8      /* connection IDs we issue/track 5.1 */
+#define QL_MAX_VERSIONS        16     /* Version Negotiation list */
+
+/* 21.3 — Anti-amplification limit: 3x received bytes before addr validation */
+#define QL_AMPLIFICATION_FACTOR  3
+
+/*
+ * 8.1 — A Retry token carries:
+ *   - the original client address (for anti-spoofing)
+ *   - a timestamp (for anti-replay 8.1.4)
+ * We store an opaque encrypted blob limited to 256 bytes.
+ */
+#define QL_TOKEN_MAX_LEN  256
+
+typedef struct {
+    uint8_t   data[QL_TOKEN_MAX_LEN];
+    size_t    len;
+    uint64_t  issued_at_ms;   /* wall-clock when we generated this token */
+} ql_token_t;
+
+/*
+ * 21.3 — Anti-amplification: server MUST NOT send more than
+ * QL_AMPLIFICATION_FACTOR × bytes_received until address is validated.
+ */
+typedef struct {
+    bool      validated;          /* true once address confirmed */
+    uint64_t  bytes_received;     /* from unvalidated peer address */
+    uint64_t  bytes_sent;         /* to unvalidated peer address */
+} ql_addr_valid_t;
 
 /* 
  * Transport ERR codes  20.1
@@ -454,6 +500,14 @@ typedef struct {
 /**
  * @link: https://www.rfc-editor.org/rfc/rfc9000.html?#name-packet-formats
  */
+typedef enum {
+    QL_PKT_VERSION_NEGOTIATION = 0,  /* §17.2.1 — special, no type bits */
+    QL_PKT_INITIAL             = 1,  /* §17.2.2 — long header, type 0x00 */
+    QL_PKT_0RTT                = 2,  /* §17.2.3 — long header, type 0x01 */
+    QL_PKT_HANDSHAKE           = 3,  /* §17.2.4 — long header, type 0x02 */
+    QL_PKT_RETRY               = 4,  /* §17.2.5 — long header, type 0x03 */
+    QL_PKT_1RTT                = 5,  /* §17.3.1 — short header */
+} ql_pkt_type_t;
 /* Long header (Initial, 0-RTT, Handshake, Retry) 17.2 */
 /*
     Long headers are used for packets that are sent prior to the 
