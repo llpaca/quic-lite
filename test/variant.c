@@ -88,12 +88,85 @@ TEST(test_decode_errors){
     EXPECT_LT(ql_varint_decode((uint8_t[]){0xFF},1,&out),0);
 }
 
+TEST(test_pkt_num_encode_decode)
+{
+    uint8_t buf[4];
+    int pn_len;
+    uint64_t truncated_pn;
+    ql_pkt_num_t decoded_pn;
+
+    /*
+     * Sender has acknowledged packet 990 and is about
+     * to send packet 1000.
+     */
+    pn_len = ql_pkt_num_encode(buf, 1000, 990);
+
+    /*
+     * Only the least significant byte is needed:
+     *
+     * 1000 = 0x03E8
+     * Sent = 0xE8
+     */
+    EXPECT_EQ(pn_len, 1);
+    EXPECT_EQ(buf[0], 0xE8);
+
+    /*
+     * Receiver extracts the truncated packet number
+     * from the wire.
+     */
+    truncated_pn = buf[0];
+
+    /*
+     * Receiver has already seen packet 999, so it
+     * expects something close to 1000.
+     */
+    decoded_pn = ql_pkt_num_decode(
+        truncated_pn,
+        pn_len * 8,
+        999);
+
+    /*
+     * The original packet number should be recovered.
+     */
+    EXPECT_EQ(decoded_pn, 1000);
+}
+
+TEST(test_pkt_num_decode_wrap)
+{
+    ql_pkt_num_t decoded_pn;
+
+    /*
+     * The wire only contains:
+     *
+     * 0x00
+     *
+     * This could mean:
+     *
+     *   0
+     *   256
+     *   512
+     *   768
+     *   ...
+     *
+     * Since we've already seen packet 255,
+     * QUIC should reconstruct packet 256.
+     */
+    decoded_pn = ql_pkt_num_decode(
+        0x00,
+        8,
+        255);
+
+    EXPECT_EQ(decoded_pn, 256);
+}
+
 int main(void){
     RUN_TEST(test_encode_rfc_examples);
     RUN_TEST(test_decode_rfc_examples);
     RUN_TEST(test_boundary_values);
     RUN_TEST(test_random_roundtrip);
     RUN_TEST(test_decode_errors);
+    RUN_TEST(test_pkt_num_encode_decode);
+    RUN_TEST(test_pkt_num_decode_wrap);
 
     ql_test_summary();
     return 0;
