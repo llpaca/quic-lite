@@ -631,6 +631,21 @@ typedef struct {
 /**
  * PUBLIC API
  */
+int  ql_varint_encoded_len(ql_varint_t val){
+    if (val <= 63)
+        return 1;
+
+    if (val <= 16383)
+        return 2;
+
+    if (val <= 1073741823ULL)
+        return 4;
+
+    if (val <= 4611686018427387903ULL)
+        return 8;
+
+    return -1; /* invalid QUIC varint */
+}       /* returns 1/2/4/8 */
 /*
     we use the first two MSB to represent the length of the integer
     2MSB	Length	Usable Bits	Range
@@ -690,26 +705,53 @@ int  ql_varint_decode(const uint8_t *buf, size_t len, ql_varint_t *out){
     *out = v;
     return (int)vlen;
 }
-int  ql_varint_encoded_len(ql_varint_t val){
-    if (val <= 63)
-        return 1;
 
-    if (val <= 16383)
-        return 2;
+int  ql_pkt_num_encode(uint8_t *buf, ql_pkt_num_t full_pn,ql_pkt_num_t largest_acked){
+    uint64_t n_unacked;
+    int pn_len;
 
-    if (val <= 1073741823ULL)
-        return 4;
+    if(full_pn <= largest_acked) n_unacked = 1;
+    else n_unacked = full_pn - largest_acked;
 
-    if (val <= 4611686018427387903ULL)
-        return 8;
+    if (n_unacked < (1ULL << 7)) pn_len = 1;
+    else if (n_unacked < (1ULL << 15)) pn_len = 2;
+    else if (n_unacked < (1ULL << 23)) pn_len = 3;
+    else pn_len = 4;
 
-    return -1; /* invalid QUIC varint */
-}       /* returns 1/2/4/8 */
+    for(int i = 0; i< pn_len; i++)
+        buf[pn_len - 1 -i] = (uint8_t)(full_pn >> (i*8)); 
 
-int  ql_pkt_num_encode(uint8_t *buf, ql_pkt_num_t full_pn,
-                        ql_pkt_num_t largest_acked);
-ql_pkt_num_t ql_pkt_num_decode(uint64_t truncated_pn, int pn_nbits,
-                                 ql_pkt_num_t largest_pn);
+    return pn_len;
+}
+
+ql_pkt_num_t ql_pkt_num_decode(uint64_t truncated_pn, int pn_nbits,ql_pkt_num_t largest_pn){
+    /* Next packet number we expect. */
+    ql_pkt_num_t expected_pn = largest_pn + 1;
+
+    /* Packet number reconstruction window. */
+    ql_pkt_num_t pn_win  = (ql_pkt_num_t)1 << pn_nbits;
+    ql_pkt_num_t pn_hwin = pn_win / 2;
+    ql_pkt_num_t pn_mask = pn_win - 1;
+
+    /* Reconstruct using expected packet number's upper bits. */
+    ql_pkt_num_t candidate_pn =
+        (expected_pn & ~pn_mask) | truncated_pn;
+
+    /* Candidate is too far behind. */
+    if (candidate_pn + pn_hwin <= expected_pn &&
+        candidate_pn < ((1ULL << 62) - pn_win))
+    {
+        candidate_pn += pn_win;
+    }
+    /* Candidate is too far ahead. */
+    else if (candidate_pn > expected_pn + pn_hwin &&
+             candidate_pn >= pn_win)
+    {
+        candidate_pn -= pn_win;
+    }
+
+    return candidate_pn;
+}
 
 int  ql_udp_socket(const char *bind_addr, uint16_t port);
 int  ql_udp_send(int fd, const struct sockaddr *addr, socklen_t addrlen,
