@@ -36,6 +36,30 @@ extern "C" {
 #include <unistd.h>
 #include <fcntl.h>
 
+/**
+ * @link: https://www.rfc-editor.org/rfc/rfc9000.html#name-variable-length-integer-enc
+ * QUIC variable-length integer (varint).  Wire encoding uses 2 MSBs of the
+ * first byte to signal total byte-width:
+ *
+ *   prefix 00 → 1 byte  (6-bit value,  max 63)
+ *   prefix 01 → 2 bytes (14-bit value, max 16 383)
+ *   prefix 10 → 4 bytes (30-bit value, max 1 073 741 823)
+ *   prefix 11 → 8 bytes (62-bit value, max 4 611 686 018 427 387 903)
+ *
+ * 16 Table 1.
+ */
+typedef uint64_t ql_varint_t;
+#define QL_VARINT_MAX      UINT64_C(4611686018427387903)  /* 2^62 − 1  §16 */
+#define QL_VARINT_1B_MAX   UINT64_C(63)
+#define QL_VARINT_2B_MAX   UINT64_C(16383)
+#define QL_VARINT_4B_MAX   UINT64_C(1073741823)
+
+/* Minimum encoded sizes for varints — useful for buffer-size assertions */
+#define QL_VARINT_1B_SIZE  1
+#define QL_VARINT_2B_SIZE  2
+#define QL_VARINT_4B_SIZE  4
+#define QL_VARINT_8B_SIZE  8
+
 /* Stream ID 2.1 — 62-bit, lower 2 bits encode initiator + direction */
 typedef uint64_t ql_stream_id_t;
 
@@ -563,8 +587,129 @@ typedef struct {
 } ql_ver_neg_pkt_t;
 
 /**
+ * @link: https://www.rfc-editor.org/rfc/rfc9000.html#name-servers-preferred-address
+ */
+/* 9.6.1 / 18.2 — server's preferred address */
+typedef struct {
+    uint8_t           ipv4[4];
+    uint16_t          ipv4_port;
+    uint8_t           ipv6[16];
+    uint16_t          ipv6_port;
+    ql_cid_t          cid;
+    ql_reset_token_t  reset_token;
+} ql_preferred_addr_t;
+
+/**
+ * @link: https://www.rfc-editor.org/rfc/rfc9000.html#name-transport-parameter-definit
+ */
+/* Full set of negotiated transport parameters for one peer */
+typedef struct {
+    uint64_t  max_idle_timeout_ms;                   /* 0 = disabled */
+    uint64_t  max_udp_payload_size;                  /* default 65527 */
+    uint64_t  initial_max_data;
+    uint64_t  initial_max_stream_data_bidi_local;
+    uint64_t  initial_max_stream_data_bidi_remote;
+    uint64_t  initial_max_stream_data_uni;
+    uint64_t  initial_max_streams_bidi;
+    uint64_t  initial_max_streams_uni;
+    uint64_t  ack_delay_exponent;                    /* default 3 */
+    uint64_t  max_ack_delay_ms;                      /* default 25 */
+    uint64_t  active_cid_limit;                      /* >= 2 */
+    bool      disable_active_migration;
+
+    ql_cid_t  original_dst_cid;
+    ql_cid_t  initial_src_cid;
+    ql_cid_t  retry_src_cid;
+    bool      has_retry_src_cid;
+
+    bool              has_stateless_reset_token;
+    ql_reset_token_t  stateless_reset_token;
+
+    bool                has_preferred_addr;
+    ql_preferred_addr_t preferred_addr;
+} ql_transport_params_t;
+/**
  * PUBLIC API
  */
+/*
+    we use the first two MSB to represent the length of the integer
+    2MSB	Length	Usable Bits	Range
+    00	       1	 6	    0-63
+    01	       2	 14	    0-16383
+    10	       4	 30	    0-1073741823
+    11	       8	 62	    0-4611686018427387903
+*/
+int  ql_varint_encode(uint8_t *buf, size_t cap, ql_varint_t val){
+    int len = ql_varint_encoded_len(val);
+    
+    if (cap < (size_t)len) return -1;
+    switch (len) {
+    case 1:
+        buf[0] = (uint8_t)val;
+        break;
+
+    case 2:
+        buf[0] = 0x40 | ((val >> 8) & 0x3F);
+        buf[1] = (uint8_t)(val & 0xFF);
+        break;
+
+    case 4:
+        buf[0] = 0x80 | ((val >> 24) & 0x3F);
+        for (int i = 1; i < 4; i++) {
+            buf[i] = (uint8_t)((val >> (24 - 8 * i)) & 0xFF);
+        }
+        break;
+
+    case 8:
+        buf[0] = 0xC0 | ((val >> 56) & 0x3F);
+        for (int i = 1; i < 8; i++) {
+            buf[i] = (uint8_t)((val >> (56 - 8 * i)) & 0xFF);
+        }
+        break;
+    }
+
+    return len;
+}
+int  ql_varint_decode(const uint8_t *buf, size_t len, ql_varint_t *out){
+    if (!buf || !out || len == 0)
+        return -1;
+
+    uint8_t first = buf[0];
+    uint8_t prefix = first >> 6;
+    size_t vlen = 1u << prefix;
+
+    if (len < vlen)
+        return -1;
+
+    ql_varint_t v = first & 0x3F;
+
+    for (size_t i = 1; i < vlen; i++) {
+        v = (v << 8) | buf[i];
+    }
+
+    *out = v;
+    return (int)vlen;
+}
+int  ql_varint_encoded_len(ql_varint_t val){
+    if (val <= 63)
+        return 1;
+
+    if (val <= 16383)
+        return 2;
+
+    if (val <= 1073741823ULL)
+        return 4;
+
+    if (val <= 4611686018427387903ULL)
+        return 8;
+
+    return -1; /* invalid QUIC varint */
+}       /* returns 1/2/4/8 */
+
+int  ql_pkt_num_encode(uint8_t *buf, ql_pkt_num_t full_pn,
+                        ql_pkt_num_t largest_acked);
+ql_pkt_num_t ql_pkt_num_decode(uint64_t truncated_pn, int pn_nbits,
+                                 ql_pkt_num_t largest_pn);
 
 int  ql_udp_socket(const char *bind_addr, uint16_t port);
 int  ql_udp_send(int fd, const struct sockaddr *addr, socklen_t addrlen,
@@ -580,6 +725,10 @@ int  ql_pkt_encode(const ql_pkt_hdr_t *hdr, const ql_keys_t *key,
                     uint8_t *out, size_t cap);
 int  ql_pkt_decode(const uint8_t *buf, size_t len, const ql_keys_t *key,
                     ql_pkt_hdr_t *hdr_out, uint8_t *payload_out, size_t cap);
+
+/* Transport-parameter encode/decode 18 */
+int  ql_tp_encode(const ql_transport_params_t *tp, uint8_t *buf, size_t cap);
+int  ql_tp_decode(const uint8_t *buf, size_t len, ql_transport_params_t *out);
 
 #if defined(__cplusplus)
 } /* extern "C" */
