@@ -173,6 +173,21 @@ typedef enum {
     QL_ERR_CRYPTO_ERROR_BASE         = 0x0100,
 } ql_transport_error_t;
 
+typedef enum {
+    QLITE_OK           =  0,
+    QLITE_ERR_AGAIN    = -1,   /* would block — try again */
+    QLITE_ERR_BUF      = -2,   /* destination buffer too small */
+    QLITE_ERR_PROTO    = -3,   /* protocol violation */
+    QLITE_ERR_CRYPTO   = -4,   /* AEAD authentication failure / TLS error */
+    QLITE_ERR_STREAM   = -5,   /* invalid stream state transition */
+    QLITE_ERR_FC       = -6,   /* flow-control limit exceeded */
+    QLITE_ERR_ARGS     = -7,   /* invalid arguments */
+    QLITE_ERR_NOMEM    = -8,   /* allocation failure */
+    QLITE_ERR_CLOSED   = -9,   /* connection or stream already closed */
+    QLITE_ERR_INTERNAL = -10,  /* internal / unexpected error */
+    QLITE_ERR_WOULDBLOCK = -11, /* non-blocking socket would block */
+} qlite_err_t;
+
 /* Application-protocol error codes 20.2 — opaque 62-bit integer */
 typedef uint64_t ql_app_error_t;
 
@@ -753,14 +768,196 @@ ql_pkt_num_t ql_pkt_num_decode(uint64_t truncated_pn, int pn_nbits,ql_pkt_num_t 
     return candidate_pn;
 }
 
+int  ql_frame_encode(const ql_frame_t *frame, uint8_t *buf, size_t cap){
+    size_t pos = 0; // this is the cursor in buffer
+
+    /* helpers*/
+    /* Write Varint — encodes val, advances pos, returns error on overflow */
+    #define WV(val) \
+        do { int _n = ql_varint_encode(buf+pos, cap-pos, (uint64_t)(val)); \
+             if (_n < 0) return _n; pos += (size_t)_n; } while(0)
+
+    /* Write Bytes — copies raw bytes, advances pos, returns error on overflow */
+    #define WB(ptr, len) \
+        do { size_t _l = (size_t)(len); \
+             if (pos + _l > cap) return QLITE_ERR_BUF; \
+             memcpy(buf + pos, (ptr), _l); pos += _l; } while(0)
+
+    switch(frame->type){
+        case QL_FRAME_PADDING:{
+            size_t pad = frame->u.padding.length;
+            if(pos + pad > cap) return QLITE_ERR_BUF;
+            memset(buf + pos, 0x00, pad);
+            pos += pad;
+            return (int)pos;
+        }
+        case QL_FRAME_PING:{
+            WV(0x01);
+            return (int)pos;
+        }
+        case QL_FRAME_ACK:
+        case QL_FRAME_ACK_ECN: {
+            const ql_frame_ack_t *f = &frame->u.ack;
+            WV(frame->type);           /* 0x02 or 0x03 */
+            WV(f->largest_acked);
+            WV(f->ack_delay);
+            WV(f->range_count);
+            WV(f->first_ack_range);
+
+            /* §19.3.1 — each extra range is a (Gap, ACK Range Length) pair */
+            for (uint64_t i = 0; i < f->range_count && i < QL_ACK_RANGE_MAX; i++) {
+                /* Gap = number of unacked packets between this range and the previous.
+                * On the wire: Gap is (actual_gap - 1), ACK Range is (count - 1)     */
+                WV(f->ranges[i].largest);   /* gap value already computed by caller   */
+                WV(f->ranges[i].count - 1); /* count - 1 per §19.3.1                  */
+            }
+
+            /* ECN counts only present in ACK_ECN (0x03) */
+            if (f->has_ecn) {
+                WV(f->ect0_count);
+                WV(f->ect1_count);
+                WV(f->ecn_ce_count);
+            }
+            return (int)pos;
+        }
+        case QL_FRAME_RESET_STREAM:{
+            WV(0x04);
+            WV(frame->u.reset_stream.stream_id);
+            WV(frame->u.reset_stream.error_code);
+            WV(frame->u.reset_stream.final_size);
+            return (int)pos;
+        }
+        case QL_FRAME_STOP_SENDING:{
+            WV(0x05);
+            WV(frame->u.stop_sending.stream_id);
+            WV(frame->u.stop_sending.error_code);
+            return (int)pos;
+        }
+        case QL_FRAME_CRYPTO:{
+            WV(0x06);
+            WV(frame->u.crypto.length);
+            WV(frame->u.crypto.offset);
+            WB(frame->u.crypto.data, frame->u.crypto.length);
+            return (int)pos;
+        }
+        case QL_FRAME_NEW_TOKEN:{
+            WV(0x07);
+            WV(frame->u.new_token.token_length);
+            WB(frame->u.new_token.token, frame->u.new_token.token_length);
+            return (int)pos;
+        }
+        /* all 8 STREAM variants fall through to same logic */
+        case QL_FRAME_STREAM: case QL_FRAME_STREAM_FIN:
+        case QL_FRAME_STREAM_LEN: case QL_FRAME_STREAM_LEN_FIN:
+        case QL_FRAME_STREAM_OFF: case QL_FRAME_STREAM_OFF_FIN:
+        case QL_FRAME_STREAM_OFF_LEN: case QL_FRAME_STREAM_OFF_LEN_FIN: {
+            const ql_frame_stream_t *f = &frame->u.stream;
+            uint8_t type = 0x08
+                | (f->fin        ? 0x01 : 0)
+                | (f->has_length ? 0x02 : 0)
+                | (f->has_offset ? 0x04 : 0);
+            WV(type); WV(f->stream_id);
+            if (f->has_offset) WV(f->offset);
+            if (f->has_length) WV(f->length);
+            WB(f->data, f->length);
+            return (int)pos;
+        }
+        case QL_FRAME_MAX_DATA:
+        WV(0x10); WV(frame->u.max_data.maximum_data);
+        return (int)pos;
+
+        case QL_FRAME_MAX_STREAM_DATA:
+            WV(0x11); WV(frame->u.max_stream_data.stream_id);
+            WV(frame->u.max_stream_data.maximum_stream_data);
+            return (int)pos;
+
+        case QL_FRAME_MAX_STREAMS_BIDI:
+        case QL_FRAME_MAX_STREAMS_UNI:
+            WV(frame->type); WV(frame->u.max_streams.maximum_streams);
+            return (int)pos;
+
+        case QL_FRAME_DATA_BLOCKED:
+            WV(0x14); WV(frame->u.data_blocked.data_limit);
+            return (int)pos;
+
+        case QL_FRAME_STREAM_DATA_BLOCKED:
+            WV(0x15); WV(frame->u.stream_data_blocked.stream_id);
+            WV(frame->u.stream_data_blocked.stream_data_limit);
+            return (int)pos;
+
+        case QL_FRAME_STREAMS_BLOCKED_BIDI:
+        case QL_FRAME_STREAMS_BLOCKED_UNI:
+            WV(frame->type); WV(frame->u.streams_blocked.stream_limit);
+            return (int)pos;
+
+        case QL_FRAME_NEW_CONNECTION_ID: {
+            const ql_frame_new_cid_t *f = &frame->u.new_cid;
+            WV(0x18); WV(f->sequence_num); WV(f->retire_prior_to);
+            /* cid_len is a plain uint8 on the wire, NOT a varint */
+            WB(&f->cid.len, 1);
+            WB(f->cid.data, f->cid.len);
+            WB(f->stateless_reset_token.data, QL_RESET_TOKEN_LEN);
+            return (int)pos;
+        }
+
+        case QL_FRAME_RETIRE_CONNECTION_ID:
+            WV(0x19); WV(frame->u.retire_cid.sequence_num);
+            return (int)pos;
+
+        case QL_FRAME_PATH_CHALLENGE:
+            /* data is 8 raw bytes, NOT a varint */
+            WV(0x1A); WB(frame->u.path_challenge.data.data, QL_PATH_DATA_LEN);
+            return (int)pos;
+
+        case QL_FRAME_PATH_RESPONSE:
+            WV(0x1B); WB(frame->u.path_response.data.data, QL_PATH_DATA_LEN);
+            return (int)pos;
+
+        case QL_FRAME_CONNECTION_CLOSE: {
+            const ql_frame_conn_close_t *f = &frame->u.conn_close;
+            WV(0x1C); WV(f->error_code); WV(f->frame_type);
+            WV(f->reason_length); WB(f->reason_phrase, f->reason_length);
+            return (int)pos;
+        }
+        case QL_FRAME_CONNECTION_CLOSE_APP: {
+            const ql_frame_conn_close_t *f = &frame->u.conn_close;
+            /* 0x1D has no frame_type field */
+            WV(0x1D); WV(f->app_error_code);
+            WV(f->reason_length); WB(f->reason_phrase, f->reason_length);
+            return (int)pos;
+        }
+
+        case QL_FRAME_HANDSHAKE_DONE:
+            WV(0x1E);
+            return (int)pos;
+
+        default:
+            return QLITE_ERR_PROTO;
+    }
+}
+
+int  ql_frame_decode(const uint8_t *buf, size_t len, ql_frame_t *out){
+    size_t pos = 0;
+
+    // step 1: read the type varint — tells us which frame this is
+    ql_varint_t type_vi;
+    int n = ql_varint_decode(buf, len, &type_vi);
+    if (n < 0) return n;
+    pos += n;
+
+    memset(out, 0, sizeof(*out));
+    out->type = (ql_frame_type_t)type_vi;
+
+    switch (out->type) {
+        
+    }
+}
+
 int  ql_udp_socket(const char *bind_addr, uint16_t port);
 int  ql_udp_send(int fd, const struct sockaddr *addr, socklen_t addrlen,
                   const uint8_t *buf, size_t len);
 int  ql_udp_recv(int fd, uint8_t *buf, size_t cap,
                   struct sockaddr_storage *src, socklen_t *srclen);
-
-int  ql_frame_encode(const ql_frame_t *frame, uint8_t *buf, size_t cap);
-int  ql_frame_decode(const uint8_t *buf, size_t len, ql_frame_t *out);
 
 int  ql_pkt_encode(const ql_pkt_hdr_t *hdr, const ql_keys_t *key,
                     const uint8_t *payload, size_t payload_len,
