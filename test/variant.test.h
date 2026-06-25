@@ -3,7 +3,7 @@
 #include <string.h>
 #include <qlite.h>
 
-int ql_tests_run = 0;
+// int ql_tests_run = 0;
 
 TEST(test_encode_rfc_examples){
     uint8_t buf[8];
@@ -159,15 +159,15 @@ TEST(test_pkt_num_decode_wrap)
     EXPECT_EQ(decoded_pn, 256);
 }
 
-int main(void){
-    RUN_TEST(test_encode_rfc_examples);
-    RUN_TEST(test_decode_rfc_examples);
-    RUN_TEST(test_boundary_values);
-    RUN_TEST(test_random_roundtrip);
-    RUN_TEST(test_decode_errors);
-    RUN_TEST(test_pkt_num_encode_decode);
-    RUN_TEST(test_pkt_num_decode_wrap);
+// int main(void){
+//     RUN_TEST(test_encode_rfc_examples);
+//     RUN_TEST(test_decode_rfc_examples);
+//     RUN_TEST(test_boundary_values);
+//     RUN_TEST(test_random_roundtrip);
+//     RUN_TEST(test_decode_errors);
+//     RUN_TEST(test_pkt_num_encode_decode);
+//     RUN_TEST(test_pkt_num_decode_wrap);
 
-    ql_test_summary();
-    return 0;
-}
+//     ql_test_summary();
+//     return 0;
+// }
