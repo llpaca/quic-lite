@@ -99,6 +99,13 @@ typedef struct {
 #define QL_VERSION_NEGOTIATION    UINT32_C(0x00000000)  /* Version Negotiation 17.2.1 */
 #define QL_VERSION_RESERVED_MASK  UINT32_C(0x0A0A0A0A)  /* 6.3 force version-neg */
 
+/* 14.1 — Datagram / MTU limits */
+#define QL_MIN_INITIAL_DATAGRAM_SIZE  1200  /* client Initial MUST be >= 1200 bytes */
+#define QL_MIN_UDP_PAYLOAD_SIZE       1200  /* 14.1 path minimum */
+#define QL_MAX_UDP_PAYLOAD_DEFAULT    65527 /* 18.2 tp default */
+#define QL_PATH_MTU_DEFAULT           1200  /* conservative initial MTU */
+#define QL_PATH_MTU_ETHERNET          1472  /* 1500 - 20(IP) - 8(UDP) */
+
 /* 13.2 — ACK tracking */
 #define QL_ACK_RANGE_MAX        64    /* max ACK ranges we track in one frame */
 #define QL_ACK_DELAY_THRESHOLD  2     /* send ACK after this many ack-eliciting pkts */
@@ -228,6 +235,40 @@ typedef enum {
     /* 19.19 */ QL_FRAME_CONNECTION_CLOSE_APP  = 0x1D,  /* app-layer error */
     /* 19.20 */ QL_FRAME_HANDSHAKE_DONE        = 0x1E,
 } ql_frame_type_t;
+
+/* 19.8 — STREAM frame bit-flags (within 0x08..0x0F) */
+#define QL_STREAM_FLAG_FIN  0x01u
+#define QL_STREAM_FLAG_LEN  0x02u
+#define QL_STREAM_FLAG_OFF  0x04u
+
+/* 18.2 — Transport parameter defaults */
+#define QL_DEFAULT_ACK_DELAY_EXP     3    /* 2^3 = 8 µs units */
+#define QL_DEFAULT_MAX_ACK_DELAY_MS  25
+#define QL_DEFAULT_ACTIVE_CID_LIMIT  2
+/* 
+ *      TRANSPORT PARAMETERS  7.4 / 18.2
+ *      Exchanged inside the TLS handshake ClientHello / EncryptedExtensions.
+ */
+
+typedef enum {
+    QL_TP_ORIGINAL_DST_CID                   = 0x00,
+    QL_TP_MAX_IDLE_TIMEOUT                   = 0x01,  /* varint, ms */
+    QL_TP_STATELESS_RESET_TOKEN              = 0x02,  /* 16 bytes */
+    QL_TP_MAX_UDP_PAYLOAD_SIZE               = 0x03,  /* varint, >= 1200 */
+    QL_TP_INITIAL_MAX_DATA                   = 0x04,
+    QL_TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL = 0x05,
+    QL_TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE= 0x06,
+    QL_TP_INITIAL_MAX_STREAM_DATA_UNI        = 0x07,
+    QL_TP_INITIAL_MAX_STREAMS_BIDI           = 0x08,
+    QL_TP_INITIAL_MAX_STREAMS_UNI            = 0x09,
+    QL_TP_ACK_DELAY_EXPONENT                 = 0x0A,  /* default 3 */
+    QL_TP_MAX_ACK_DELAY                      = 0x0B,  /* varint, ms, default 25 */
+    QL_TP_DISABLE_ACTIVE_MIGRATION           = 0x0C,  /* empty presence = true */
+    QL_TP_PREFERRED_ADDRESS                  = 0x0D,  /* server only */
+    QL_TP_ACTIVE_CONNECTION_ID_LIMIT         = 0x0E,  /* varint, >= 2 */
+    QL_TP_INITIAL_SOURCE_CID                 = 0x0F,
+    QL_TP_RETRY_SOURCE_CID                   = 0x10,
+} ql_tp_id_t;
 
 /*
     A PADDING frame (type=0x00) has no semantic value. 
@@ -937,7 +978,25 @@ int  ql_frame_encode(const ql_frame_t *frame, uint8_t *buf, size_t cap){
 }
 
 int  ql_frame_decode(const uint8_t *buf, size_t len, ql_frame_t *out){
+    if(!buf || !out || len == 0) return QLITE_ERR_ARGS;
     size_t pos = 0;
+
+#define RV(field)                                                          \
+    do {                                                                   \
+        ql_varint_t _v;                                                    \
+        int _n = ql_varint_decode(buf + pos, len - pos, &_v);             \
+        if (_n < 0 || pos + (size_t)_n > len) return QLITE_ERR_BUF;      \
+        (field) = (__typeof__(field))_v;                                   \
+        pos += (size_t)_n;                                                 \
+    } while (0)
+
+#define RB(dst, n)                                                         \
+    do {                                                                   \
+        size_t _l = (size_t)(n);                                           \
+        if (pos + _l > len) return QLITE_ERR_BUF;                         \
+        memcpy((dst), buf + pos, _l);                                      \
+        pos += _l;                                                         \
+    } while (0)
 
     // step 1: read the type varint — tells us which frame this is
     ql_varint_t type_vi;
@@ -949,7 +1008,195 @@ int  ql_frame_decode(const uint8_t *buf, size_t len, ql_frame_t *out){
     out->type = (ql_frame_type_t)type_vi;
 
     switch (out->type) {
-        
+    case QL_FRAME_PADDING:{
+        size_t count = 1;
+        while(pos < len && buf[pos] == 0x00) { pos++; count++;}
+        out->u.padding.length = count;
+        return (int)pos;
+    }
+
+    case QL_FRAME_PING:
+        return (int)pos;
+
+    case QL_FRAME_ACK:
+    case QL_FRAME_ACK_ECN:{
+        ql_frame_ack_t *a = &out->u.ack;
+        a->has_ecn = (out->type == QL_FRAME_ACK_ECN);
+
+        RV(a->largest_acked);
+        RV(a->ack_delay);
+        RV(a->range_count);
+        RV(a->first_ack_range);
+
+        ql_pkt_num_t prev_sml = a->largest_acked - a->first_ack_range;
+        uint64_t n_ranges = a->range_count < QL_ACK_RANGE_MAX ? a->range_count : QL_ACK_RANGE_MAX;
+
+        for(uint64_t i = 0; i < n_ranges; i++){
+            ql_varint_t gap, range_len;
+            RV(gap);
+            RV(range_len);
+
+            ql_pkt_num_t this_largest = prev_sml - gap - 2;
+            a->ranges[i].largest = this_largest;
+            a->ranges[i].count   = range_len + 1;
+            prev_sml = this_largest - range_len; /* smallest of this range */
+        }
+
+        if(a->has_ecn){
+            RV(a->ect0_count);
+            RV(a->ect1_count);
+            RV(a->ecn_ce_count);
+        }
+        return (int)pos;
+    }
+
+    case QL_FRAME_RESET_STREAM:{
+        ql_frame_reset_stream_t *f = &out->u.reset_stream;
+        RV(f->stream_id);
+        RV(f->error_code);
+        RV(f->final_size);
+        return (int)pos;
+    }
+
+    case QL_FRAME_STOP_SENDING: {
+        ql_frame_stop_sending_t *f = &out->u.stop_sending;
+        RV(f->stream_id);
+        RV(f->error_code);
+        return (int)pos;
+    }
+
+     case QL_FRAME_CRYPTO: {
+        ql_frame_crypto_t *f = &out->u.crypto;
+        RV(f->offset);
+        RV(f->length);
+        if (pos + (size_t)f->length > len) return QLITE_ERR_BUF;
+        f->data = buf + pos;          /* zero-copy: points into caller's buf */
+        pos += (size_t)f->length;
+        return (int)pos;
+    }
+
+    case QL_FRAME_NEW_TOKEN: {
+        ql_frame_new_token_t *f = &out->u.new_token;
+        RV(f->token_length);
+        if (pos + (size_t)f->token_length > len) return QLITE_ERR_BUF;
+        f->token = buf + pos;         /* zero-copy */
+        pos += (size_t)f->token_length;
+        return (int)pos;
+    }
+
+    case QL_FRAME_STREAM:
+    case QL_FRAME_STREAM_FIN:
+    case QL_FRAME_STREAM_LEN:
+    case QL_FRAME_STREAM_LEN_FIN:
+    case QL_FRAME_STREAM_OFF:
+    case QL_FRAME_STREAM_OFF_FIN:
+    case QL_FRAME_STREAM_OFF_LEN:
+    case QL_FRAME_STREAM_OFF_LEN_FIN: {
+        ql_frame_stream_t *f = &out->u.stream;
+        uint8_t flags  = (uint8_t)out->type & 0x07u;
+        f->fin         = (flags & QL_STREAM_FLAG_FIN) != 0;
+        f->has_length  = (flags & QL_STREAM_FLAG_LEN) != 0;
+        f->has_offset  = (flags & QL_STREAM_FLAG_OFF) != 0;
+
+        RV(f->stream_id);
+
+        if (f->has_offset) RV(f->offset);  /* else offset = 0 (implicit) */
+
+        if (f->has_length) {
+            RV(f->length);
+            if (pos + (size_t)f->length > len) return QLITE_ERR_BUF;
+            f->data = buf + pos;      /* zero-copy */
+            pos += (size_t)f->length;
+        } else {
+            /* No LEN bit: data runs to end of the enclosing packet §19.8 */
+            f->length = (uint64_t)(len - pos);
+            f->data   = buf + pos;
+            pos       = len;
+        }
+        return (int)pos;
+    }
+
+    case QL_FRAME_MAX_DATA:
+        RV(out->u.max_data.maximum_data);
+        return (int)pos;
+
+    case QL_FRAME_MAX_STREAM_DATA: {
+        ql_frame_max_stream_data_t *f = &out->u.max_stream_data;
+        RV(f->stream_id);
+        RV(f->maximum_stream_data);
+        return (int)pos;
+    }
+
+    case QL_FRAME_MAX_STREAMS_BIDI:
+    case QL_FRAME_MAX_STREAMS_UNI:
+        RV(out->u.max_streams.maximum_streams);
+        return (int)pos;
+
+    case QL_FRAME_DATA_BLOCKED:
+        RV(out->u.data_blocked.data_limit);
+        return (int)pos;
+
+    case QL_FRAME_STREAM_DATA_BLOCKED: {
+        ql_frame_stream_data_blocked_t *f = &out->u.stream_data_blocked;
+        RV(f->stream_id);
+        RV(f->stream_data_limit);
+        return (int)pos;
+    }
+
+    case QL_FRAME_STREAMS_BLOCKED_BIDI:
+    case QL_FRAME_STREAMS_BLOCKED_UNI:
+        RV(out->u.streams_blocked.stream_limit);
+        return (int)pos;
+
+    case QL_FRAME_NEW_CONNECTION_ID: {
+        ql_frame_new_cid_t *f = &out->u.new_cid;
+        RV(f->sequence_num);
+        RV(f->retire_prior_to);
+        /* CID length is a plain uint8_t on the wire, NOT a varint §19.15 */
+        if (pos >= len) return QLITE_ERR_BUF;
+        f->cid.len = buf[pos++];
+        if (f->cid.len > QL_CID_MAX_LEN) return QLITE_ERR_PROTO;
+        RB(f->cid.data, f->cid.len);
+        /* Stateless Reset Token: always exactly 16 bytes §19.15 */
+        RB(f->stateless_reset_token.data, QL_RESET_TOKEN_LEN);
+        return (int)pos;
+    }
+
+    case QL_FRAME_RETIRE_CONNECTION_ID:
+        RV(out->u.retire_cid.sequence_num);
+        return (int)pos;
+
+    case QL_FRAME_PATH_CHALLENGE:
+        RB(out->u.path_challenge.data.data, QL_PATH_DATA_LEN);
+        return (int)pos;
+
+    case QL_FRAME_PATH_RESPONSE:
+        RB(out->u.path_response.data.data, QL_PATH_DATA_LEN);
+        return (int)pos;
+
+    case QL_FRAME_CONNECTION_CLOSE:
+    case QL_FRAME_CONNECTION_CLOSE_APP: {
+        ql_frame_conn_close_t *f = &out->u.conn_close;
+        f->is_app = (out->type == QL_FRAME_CONNECTION_CLOSE_APP);
+
+        if (!f->is_app) {
+            RV(f->error_code);
+            RV(f->frame_type);
+        } else {
+            RV(f->app_error_code);
+        }
+        RV(f->reason_length);
+        if (pos + (size_t)f->reason_length > len) return QLITE_ERR_BUF;
+        f->reason_phrase = buf + pos;  /* zero-copy */
+        pos += (size_t)f->reason_length;
+        return (int)pos;
+    }
+    
+    case QL_FRAME_HANDSHAKE_DONE:
+        return (int)pos;
+
+    default:
+        return QLITE_ERR_PROTO;
     }
 }
 
@@ -966,8 +1213,180 @@ int  ql_pkt_decode(const uint8_t *buf, size_t len, const ql_keys_t *key,
                     ql_pkt_hdr_t *hdr_out, uint8_t *payload_out, size_t cap);
 
 /* Transport-parameter encode/decode 18 */
-int  ql_tp_encode(const ql_transport_params_t *tp, uint8_t *buf, size_t cap);
-int  ql_tp_decode(const uint8_t *buf, size_t len, ql_transport_params_t *out);
+int ql_tp_encode(const ql_transport_params_t *tp, uint8_t *buf, size_t cap) {
+    if (!tp || !buf) return QLITE_ERR_ARGS;
+    size_t pos = 0;
+
+#define TP_VARINT(id, val) \
+    do { if (tp_write_varint(buf, &pos, cap, (id), (val)) < 0) return QLITE_ERR_BUF; } while(0)
+#define TP_BYTES(id, data, len) \
+    do { if (tp_write_bytes(buf, &pos, cap, (id), (data), (len)) < 0) return QLITE_ERR_BUF; } while(0)
+#define TP_CID(id, cid) \
+    do { if (tp_write_cid(buf, &pos, cap, (id), (cid)) < 0) return QLITE_ERR_BUF; } while(0)
+
+    if (tp->max_idle_timeout_ms)
+        TP_VARINT(QL_TP_MAX_IDLE_TIMEOUT, tp->max_idle_timeout_ms);
+
+    if (tp->max_udp_payload_size && tp->max_udp_payload_size != QL_MAX_UDP_PAYLOAD_DEFAULT)
+        TP_VARINT(QL_TP_MAX_UDP_PAYLOAD_SIZE, tp->max_udp_payload_size);
+
+    if (tp->initial_max_data)
+        TP_VARINT(QL_TP_INITIAL_MAX_DATA, tp->initial_max_data);
+
+    if (tp->initial_max_stream_data_bidi_local)
+        TP_VARINT(QL_TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, tp->initial_max_stream_data_bidi_local);
+
+    if (tp->initial_max_stream_data_bidi_remote)
+        TP_VARINT(QL_TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, tp->initial_max_stream_data_bidi_remote);
+
+    if (tp->initial_max_stream_data_uni)
+        TP_VARINT(QL_TP_INITIAL_MAX_STREAM_DATA_UNI, tp->initial_max_stream_data_uni);
+
+    if (tp->initial_max_streams_bidi)
+        TP_VARINT(QL_TP_INITIAL_MAX_STREAMS_BIDI, tp->initial_max_streams_bidi);
+
+    if (tp->initial_max_streams_uni)
+        TP_VARINT(QL_TP_INITIAL_MAX_STREAMS_UNI, tp->initial_max_streams_uni);
+
+    if (tp->ack_delay_exponent != QL_DEFAULT_ACK_DELAY_EXP)
+        TP_VARINT(QL_TP_ACK_DELAY_EXPONENT, tp->ack_delay_exponent);
+
+    if (tp->max_ack_delay_ms != QL_DEFAULT_MAX_ACK_DELAY_MS)
+        TP_VARINT(QL_TP_MAX_ACK_DELAY, tp->max_ack_delay_ms);
+
+    if (tp->active_cid_limit != QL_DEFAULT_ACTIVE_CID_LIMIT)
+        TP_VARINT(QL_TP_ACTIVE_CONNECTION_ID_LIMIT, tp->active_cid_limit);
+
+    if (tp->disable_active_migration) {
+        /* Empty value — just id + length=0 */
+        int n = ql_varint_encode(buf + pos, cap - pos, QL_TP_DISABLE_ACTIVE_MIGRATION);
+        if (n < 0 || pos + (size_t)n + 1 > cap) return QLITE_ERR_BUF;
+        pos += (size_t)n;
+        buf[pos++] = 0x00;  /* length = 0 */
+    }
+
+    if (tp->has_stateless_reset_token)
+        TP_BYTES(QL_TP_STATELESS_RESET_TOKEN,
+                 tp->stateless_reset_token.data, QL_RESET_TOKEN_LEN);
+
+    if (tp->original_dst_cid.len)
+        TP_CID(QL_TP_ORIGINAL_DST_CID, &tp->original_dst_cid);
+
+    if (tp->initial_src_cid.len)
+        TP_CID(QL_TP_INITIAL_SOURCE_CID, &tp->initial_src_cid);
+
+    if (tp->has_retry_src_cid && tp->retry_src_cid.len)
+        TP_CID(QL_TP_RETRY_SOURCE_CID, &tp->retry_src_cid);
+
+#undef TP_VARINT
+#undef TP_BYTES
+#undef TP_CID
+
+    return (int)pos;
+}
+
+int ql_tp_decode(const uint8_t *buf, size_t len, ql_transport_params_t *out) {
+    if (!buf || !out) return QLITE_ERR_ARGS;
+    memset(out, 0, sizeof(*out));
+
+    /* Apply RFC defaults */
+    out->max_udp_payload_size = QL_MAX_UDP_PAYLOAD_DEFAULT;
+    out->ack_delay_exponent   = QL_DEFAULT_ACK_DELAY_EXP;
+    out->max_ack_delay_ms     = QL_DEFAULT_MAX_ACK_DELAY_MS;
+    out->active_cid_limit     = QL_DEFAULT_ACTIVE_CID_LIMIT;
+
+    size_t pos = 0;
+    while (pos < len) {
+        ql_varint_t id, tp_len;
+        if (ql__read_varint(buf, &pos, len, &id)     < 0) return QLITE_ERR_PROTO;
+        if (ql__read_varint(buf, &pos, len, &tp_len) < 0) return QLITE_ERR_PROTO;
+
+        size_t val_end = pos + (size_t)tp_len;
+        if (val_end > len) return QLITE_ERR_PROTO;
+
+        ql_varint_t v;
+
+        switch ((ql_tp_id_t)id) {
+            case QL_TP_MAX_IDLE_TIMEOUT:
+                if (ql_varint_decode(buf + pos, tp_len, &v) < 0) return QLITE_ERR_PROTO;
+                out->max_idle_timeout_ms = v;
+                break;
+            case QL_TP_MAX_UDP_PAYLOAD_SIZE:
+                if (ql_varint_decode(buf + pos, tp_len, &v) < 0) return QLITE_ERR_PROTO;
+                if (v < QL_MIN_UDP_PAYLOAD_SIZE) return QLITE_ERR_PROTO;
+                out->max_udp_payload_size = v;
+                break;
+            case QL_TP_INITIAL_MAX_DATA:
+                if (ql_varint_decode(buf + pos, tp_len, &v) < 0) return QLITE_ERR_PROTO;
+                out->initial_max_data = v;
+                break;
+            case QL_TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL:
+                if (ql_varint_decode(buf + pos, tp_len, &v) < 0) return QLITE_ERR_PROTO;
+                out->initial_max_stream_data_bidi_local = v;
+                break;
+            case QL_TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE:
+                if (ql_varint_decode(buf + pos, tp_len, &v) < 0) return QLITE_ERR_PROTO;
+                out->initial_max_stream_data_bidi_remote = v;
+                break;
+            case QL_TP_INITIAL_MAX_STREAM_DATA_UNI:
+                if (ql_varint_decode(buf + pos, tp_len, &v) < 0) return QLITE_ERR_PROTO;
+                out->initial_max_stream_data_uni = v;
+                break;
+            case QL_TP_INITIAL_MAX_STREAMS_BIDI:
+                if (ql_varint_decode(buf + pos, tp_len, &v) < 0) return QLITE_ERR_PROTO;
+                out->initial_max_streams_bidi = v;
+                break;
+            case QL_TP_INITIAL_MAX_STREAMS_UNI:
+                if (ql_varint_decode(buf + pos, tp_len, &v) < 0) return QLITE_ERR_PROTO;
+                out->initial_max_streams_uni = v;
+                break;
+            case QL_TP_ACK_DELAY_EXPONENT:
+                if (ql_varint_decode(buf + pos, tp_len, &v) < 0) return QLITE_ERR_PROTO;
+                if (v > 20) return QLITE_ERR_PROTO; /* §18.2: MUST be <= 20 */
+                out->ack_delay_exponent = v;
+                break;
+            case QL_TP_MAX_ACK_DELAY:
+                if (ql_varint_decode(buf + pos, tp_len, &v) < 0) return QLITE_ERR_PROTO;
+                if (v >= (UINT64_C(1) << 14)) return QLITE_ERR_PROTO; /* §18.2 */
+                out->max_ack_delay_ms = v;
+                break;
+            case QL_TP_ACTIVE_CONNECTION_ID_LIMIT:
+                if (ql_varint_decode(buf + pos, tp_len, &v) < 0) return QLITE_ERR_PROTO;
+                if (v < 2) return QLITE_ERR_PROTO; /* §18.2: MUST be >= 2 */
+                out->active_cid_limit = v;
+                break;
+            case QL_TP_DISABLE_ACTIVE_MIGRATION:
+                out->disable_active_migration = true;
+                break;
+            case QL_TP_STATELESS_RESET_TOKEN:
+                if (tp_len != QL_RESET_TOKEN_LEN) return QLITE_ERR_PROTO;
+                memcpy(out->stateless_reset_token.data, buf + pos, QL_RESET_TOKEN_LEN);
+                out->has_stateless_reset_token = true;
+                break;
+            case QL_TP_ORIGINAL_DST_CID:
+                if (tp_len > QL_CID_MAX_LEN) return QLITE_ERR_PROTO;
+                out->original_dst_cid.len = (uint8_t)tp_len;
+                memcpy(out->original_dst_cid.data, buf + pos, tp_len);
+                break;
+            case QL_TP_INITIAL_SOURCE_CID:
+                if (tp_len > QL_CID_MAX_LEN) return QLITE_ERR_PROTO;
+                out->initial_src_cid.len = (uint8_t)tp_len;
+                memcpy(out->initial_src_cid.data, buf + pos, tp_len);
+                break;
+            case QL_TP_RETRY_SOURCE_CID:
+                if (tp_len > QL_CID_MAX_LEN) return QLITE_ERR_PROTO;
+                out->retry_src_cid.len = (uint8_t)tp_len;
+                memcpy(out->retry_src_cid.data, buf + pos, tp_len);
+                out->has_retry_src_cid = true;
+                break;
+            default:
+                /* §7.4.2 — unknown TP IDs MUST be ignored */
+                break;
+        }
+        pos = val_end;
+    }
+    return (int)pos;
+}
 
 #if defined(__cplusplus)
 } /* extern "C" */
