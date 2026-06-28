@@ -38,6 +38,10 @@ extern "C" {
 #include <unistd.h>
 #include <fcntl.h>
 
+/* dependcies*/
+#include <openssl/evp.h>
+#include <openssl/aes.h>
+
 /* helpers*/
 /* Write Varint — encodes val, advances pos, returns error on overflow */
 #define WV(val) \
@@ -1424,6 +1428,100 @@ int  ql_udp_recv(int fd, uint8_t *buf, size_t cap,
     if(errno == EAGAIN || errno == EWOULDBLOCK) return QLITE_ERR_WOULDBLOCK;
     return QLITE_ERR_INTERNAL;
 }
+
+/* RFC 9001 5.3 — build per-packet nonce by XOR-ing IV with packet number */
+static void ql__build_nonce(const ql_keys_t *key, ql_pkt_num_t pkt_num,
+                             uint8_t *nonce)
+{
+    memcpy(nonce, key->iv, key->iv_len);
+    /* packet number is big-endian in the rightmost bytes */
+    for (int i = 0; i < 8; i++) {
+        nonce[key->iv_len - 1 - i] ^= (uint8_t)(pkt_num >> (8 * i));
+    }
+}
+
+/* AEAD seal / open (RFC 9001 5.3) */
+int  ql_aead_seal(const ql_keys_t *key, ql_pkt_num_t pkt_num,
+                   const uint8_t *aad, size_t aad_len,
+                   const uint8_t *plaintext, size_t pt_len,
+                   uint8_t *out, size_t cap)
+{
+    if(!key || !key->is_set || !out) return QLITE_ERR_ARGS;
+    if(cap < pt_len + QL_AEAD_TAG_LEN) return QLITE_ERR_BUF;
+
+    uint8_t nonce[QL_AEAD_IV_MAX_LEN];
+    ql__build_nonce(key, pkt_num, nonce);
+
+    const EVP_CIPHER *cipher = (key->key_len == 16) ? EVP_aes_128_gcm() : EVP_aes_256_gcm();
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if(!ctx) return QLITE_ERR_INTERNAL;
+
+    int ret = QLITE_ERR_CRYPTO;
+    int outl =0, outl2 = 0;
+
+    if (!EVP_EncryptInit_ex(ctx, cipher, NULL, NULL, NULL))            goto done;
+    if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, key->iv_len, NULL)) goto done;
+    if (!EVP_EncryptInit_ex(ctx, NULL, NULL, key->key, nonce))         goto done;
+    if (aad_len && !EVP_EncryptUpdate(ctx, NULL, &outl, aad, (int)aad_len)) goto done;
+    if (!EVP_EncryptUpdate(ctx, out, &outl, plaintext, (int)pt_len))   goto done;
+    if (!EVP_EncryptFinal_ex(ctx, out + outl, &outl2))                 goto done;
+    if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, QL_AEAD_TAG_LEN,
+                              out + outl + outl2))                      goto done;
+
+    ret = outl + outl2 + QL_AEAD_TAG_LEN;
+done:
+    EVP_CIPHER_CTX_free(ctx);
+    return ret;
+}
+
+int  ql_aead_open(const ql_keys_t *key, ql_pkt_num_t pkt_num,
+                   const uint8_t *aad, size_t aad_len,
+                   const uint8_t *ciphertext, size_t ct_len,
+                   uint8_t *out, size_t cap)
+{
+    if (!key || !key->is_set || !ciphertext || !out)
+        return QLITE_ERR_ARGS;
+    if (ct_len < QL_AEAD_TAG_LEN)
+        return QLITE_ERR_PROTO;
+
+    size_t pt_len = ct_len - QL_AEAD_TAG_LEN;
+    if (cap < pt_len)
+        return QLITE_ERR_BUF;
+
+    uint8_t nonce[QL_AEAD_IV_MAX_LEN];
+    ql__build_nonce(key, pkt_num, nonce);
+
+    const EVP_CIPHER *cipher = (key->key_len == 16)
+        ? EVP_aes_128_gcm() : EVP_aes_256_gcm();
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return QLITE_ERR_INTERNAL;
+
+    int ret = QLITE_ERR_CRYPTO;
+    int outl = 0, outl2 = 0;
+
+    if (!EVP_DecryptInit_ex(ctx, cipher, NULL, NULL, NULL))            goto done;
+    if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, key->iv_len, NULL)) goto done;
+    if (!EVP_DecryptInit_ex(ctx, NULL, NULL, key->key, nonce))         goto done;
+    if (aad_len && !EVP_DecryptUpdate(ctx, NULL, &outl, aad, (int)aad_len)) goto done;
+    if (!EVP_DecryptUpdate(ctx, out, &outl, ciphertext, (int)pt_len))  goto done;
+    /* set expected tag (last 16 bytes of ciphertext) */
+    if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, QL_AEAD_TAG_LEN,
+                              (void *)(ciphertext + pt_len)))           goto done;
+    if (EVP_DecryptFinal_ex(ctx, out + outl, &outl2) <= 0)             goto done;
+
+    ret = outl + outl2;
+done:
+    EVP_CIPHER_CTX_free(ctx);
+    return ret;
+}
+
+/* Header protection (RFC 9001 5.4) */
+int  ql_hp_protect(const ql_keys_t *key, uint8_t *hdr, size_t hdr_len,
+                    const uint8_t *sample);
+int  ql_hp_remove(const ql_keys_t *key, uint8_t *hdr, size_t hdr_len,
+                   const uint8_t *sample);
 
 int  ql_pkt_encode(const ql_pkt_hdr_t *hdr, const ql_keys_t *key,
                     const uint8_t *payload, size_t payload_len,
