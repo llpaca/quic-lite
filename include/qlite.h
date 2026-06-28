@@ -1700,7 +1700,7 @@ int  ql_pkt_encode(const ql_pkt_hdr_t *hdr, const ql_keys_t *key,
         pos += sh->dst_cid.len;
 
         /* pkt num*/
-        int pn_len = ql_pkt_num_decode(out + pos, sh->pkt_num, QL_PKT_NUM_NONE);
+        int pn_len = ql_pkt_num_encode(out + pos, sh->pkt_num, QL_PKT_NUM_NONE);
         if(pn_len < 0) return pn_len;
         pos += (size_t)pn_len;
     }
