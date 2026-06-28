@@ -1367,10 +1367,50 @@ try_ipv4:
     return fd;
 }
 
+/*
+ * ql_udp_send — sends one UDP datagram.
+ *
+ * Returns bytes sent (>= 0), QLITE_ERR_WOULDBLOCK if the socket would
+ * block, or QLITE_ERR_INTERNAL on a hard error.
+ *
+ * 14.1: if sendmsg returns EMSGSIZE the caller should lower the path MTU
+ * and re-fragment — we surface this as QLITE_ERR_BUF so the caller can
+ * detect it.
+ */
 int  ql_udp_send(int fd, const struct sockaddr *addr, socklen_t addrlen,
-                  const uint8_t *buf, size_t len);
+                  const uint8_t *buf, size_t len)
+{
+    ssize_t sent = sendto(fd, buf, len, 0, addr, addrlen);
+    if(sent >= 0) return (int)sent;
+
+    if(errno == EAGAIN || errno == EWOULDBLOCK) return QLITE_ERR_WOULDBLOCK;
+    if(errno == EMSGSIZE) return QLITE_ERR_BUF;
+    return QLITE_ERR_INTERNAL;
+}
+
+/*
+ * ql_udp_recv — receives one UDP datagram.
+ *
+ * Returns bytes received (>= 0), QLITE_ERR_WOULDBLOCK if no data ready,
+ * or QLITE_ERR_INTERNAL on error.
+ *
+ * src and srclen are populated with the sender's address (may be NULL).
+ */
 int  ql_udp_recv(int fd, uint8_t *buf, size_t cap,
-                  struct sockaddr_storage *src, socklen_t *srclen);
+                  struct sockaddr_storage *src, socklen_t *srclen)
+{
+    socklen_t addrlen = src ? sizeof(*src) : 0;
+    ssize_t n = recvfrom(fd, buf, cap, 0,
+                            src ? (struct sockaddr *)src : NULL,
+                            src ? &addrlen : NULL);
+                            
+    if(n>=0){
+        if(srclen) *srclen = addrlen;
+        return (int)n;
+    }
+    if(errno == EAGAIN || errno == EWOULDBLOCK) return QLITE_ERR_WOULDBLOCK;
+    return QLITE_ERR_INTERNAL;
+}
 
 int  ql_pkt_encode(const ql_pkt_hdr_t *hdr, const ql_keys_t *key,
                     const uint8_t *payload, size_t payload_len,
