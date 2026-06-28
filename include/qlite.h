@@ -9,7 +9,9 @@
  *   RFC 9001  Using TLS to Secure QUIC
  *   RFC 9002  QUIC Loss Detection and Congestion Control
  */
-#define _POSIX_C_SOURCE 199309L
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #ifndef QLITE_H
 #define QLITE_H
 
@@ -1338,7 +1340,7 @@ int  ql_udp_socket(const char *bind_addr, uint16_t port){
     }
 
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    flags = fctnl(fd, F_GETFL, 0);
+    flags = fcntl(fd, F_GETFL, 0);
     if(flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
         bind(fd, (struct sockaddr *)&addr6, sizeof(addr6)) != 0){
             close(fd);
@@ -1390,6 +1392,7 @@ try_ipv4:
 int  ql_udp_send(int fd, const struct sockaddr *addr, socklen_t addrlen,
                   const uint8_t *buf, size_t len)
 {
+    if(len <= 0) return QLITE_ERR_ARGS;
     ssize_t sent = sendto(fd, buf, len, 0, addr, addrlen);
     if(sent >= 0) return (int)sent;
 
