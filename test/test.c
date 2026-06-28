@@ -1,7 +1,9 @@
+#define _POSIX_C_SOURCE 200809L
 #include "test.h"
 #include "frames.test.h"
 #include "variant.test.h"
 #include "tp.test.h"
+#include "udp.test.h"
 
 int ql_tests_run = 0;
 
@@ -49,6 +51,29 @@ int main(void){
     RUN_TEST(test_tp_cid_fields);
     RUN_TEST(test_tp_buf_too_small);
     RUN_TEST(test_tp_invalid_payload_size);
+
+    /* udp socket/send/recv */
+    RUN_TEST(test_udp_socket_bind_any_ephemeral_port);
+    RUN_TEST(test_udp_socket_bind_specific_loopback);
+    RUN_TEST(test_udp_socket_is_nonblocking);
+    RUN_TEST(test_udp_socket_rejects_bad_address);
+    RUN_TEST(test_udp_socket_two_sockets_get_distinct_ports);
+
+    RUN_TEST(test_udp_recv_returns_again_when_empty);
+    /** @todo we need a null arg handler*/
+    // RUN_TEST(test_udp_recv_rejects_null_args);
+    // RUN_TEST(test_udp_send_rejects_null_buf);
+    
+    RUN_TEST(test_udp_send_rejects_zero_len);
+    RUN_TEST(test_udp_send_returns_full_length_on_success);
+
+    RUN_TEST(test_udp_send_recv_roundtrip);
+    RUN_TEST(test_udp_recv_reports_correct_source_address);
+    RUN_TEST(test_udp_recv_again_after_drain);
+
+    RUN_TEST(test_now_ms_is_nonzero);
+    RUN_TEST(test_now_ms_is_monotonic_nondecreasing);
+    RUN_TEST(test_now_ms_advances_after_sleep);
 
     ql_test_summary();
     return 0;
