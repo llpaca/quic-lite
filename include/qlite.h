@@ -1533,37 +1533,48 @@ static int ql__hp_apply(const ql_keys_t *key, uint8_t *hdr, size_t hdr_len,
     if (!key || !key->is_set || !hdr || !sample || hdr_len < 2)
         return QLITE_ERR_ARGS;
 
-    AES_KEY aes;
-    if (AES_set_encrypt_key(key->hp, key->hp_len * 8, &aes) != 0)
-        return QLITE_ERR_CRYPTO;
+    /* AES-ECB on one 16-byte block via EVP — no deprecated AES_* symbols */
+    uint8_t mask[16];
+    int mask_len = 0;
 
-    uint8_t mask[AES_BLOCK_SIZE];
-    AES_ecb_encrypt(sample, mask, &aes, AES_ENCRYPT);
+    const EVP_CIPHER *ecb = (key->hp_len == 16)
+        ? EVP_aes_128_ecb() : EVP_aes_256_ecb();
 
-    uint8_t first = hdr[0];
-    bool is_long  = (first & 0x80) != 0;
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return QLITE_ERR_INTERNAL;
 
-    uint8_t pn_len;
-    if (protect) {
-        pn_len = (first & 0x03) + 1;
-    } else {
-        uint8_t first_unmasked = first ^ (mask[0] & (is_long ? 0x0F : 0x1F));
-        pn_len = (first_unmasked & 0x03) + 1;
+    int ret = QLITE_ERR_CRYPTO;
+
+    if (!EVP_EncryptInit_ex(ctx, ecb, NULL, key->hp, NULL)) goto done;
+    EVP_CIPHER_CTX_set_padding(ctx, 0);   /* single exact block, no padding */
+    if (!EVP_EncryptUpdate(ctx, mask, &mask_len, sample, 16)) goto done;
+    /* no EVP_EncryptFinal needed — padding disabled, block is already complete */
+
+    {
+        uint8_t first    = hdr[0];
+        bool    is_long  = (first & 0x80) != 0;
+        uint8_t pn_len;
+
+        if (protect) {
+            pn_len = (first & 0x03) + 1;
+        } else {
+            uint8_t first_unmasked = first ^ (mask[0] & (is_long ? 0x0F : 0x1F));
+            pn_len = (first_unmasked & 0x03) + 1;
+        }
+
+        if (hdr_len < (size_t)(1 + pn_len)) { ret = QLITE_ERR_BUF; goto done; }
+
+        hdr[0] ^= mask[0] & (is_long ? 0x0F : 0x1F);
+
+        uint8_t *pn = hdr + hdr_len - pn_len;
+        for (uint8_t i = 0; i < pn_len; i++)
+            pn[i] ^= mask[1 + i];
     }
 
-    if (hdr_len < (size_t)(1 + pn_len))
-        return QLITE_ERR_BUF;
-
-    /* apply mask to first byte */
-    hdr[0] ^= mask[0] & (is_long ? 0x0F : 0x1F);
-
-    /* apply mask to packet number bytes (at end of hdr) */
-    uint8_t *pn = hdr + hdr_len - pn_len;
-    for (uint8_t i = 0; i < pn_len; i++)
-        pn[i] ^= mask[1 + i];
-
-    (void)protect;
-    return QLITE_OK;
+    ret = QLITE_OK;
+done:
+    EVP_CIPHER_CTX_free(ctx);
+    return ret;
 }
 
 /* Header protection (RFC 9001 5.4) */
