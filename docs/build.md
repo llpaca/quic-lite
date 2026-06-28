@@ -127,8 +127,8 @@ Depends on: Phase 1 (varint, frame encode/decode for payload construction).
 | Sub-chunk | Symbol(s) | Notes |
 |---|---|---|
 | 2.1.1 | Nonce construction | XOR packet number (big-endian padded) into IV |
-| 2.1.2 | `ql_aead_seal()` | AES-128-GCM or AES-256-GCM via OpenSSL EVP |
-| 2.1.3 | `ql_aead_open()` | authenticate + decrypt; `QLITE_ERR_CRYPTO` on tag failure |
+| 2.1.2 [x]| `ql_aead_seal()` | AES-128-GCM or AES-256-GCM via OpenSSL EVP |
+| 2.1.3 [x]| `ql_aead_open()` | authenticate + decrypt; `QLITE_ERR_CRYPTO` on tag failure |
 
 **Test gate 2.1:** Use RFC 9001 Appendix B sample vectors for AES-128-GCM.  Flip one ciphertext byte, verify `QLITE_ERR_CRYPTO`.
 
@@ -139,8 +139,8 @@ Depends on: Phase 1 (varint, frame encode/decode for payload construction).
 | Sub-chunk | Symbol(s) | Notes |
 |---|---|---|
 | 2.2.1 | AES-ECB mask generation | encrypt 16-byte sample under HP key |
-| 2.2.2 | `ql_hp_protect()` | XOR mask into first-byte bits and pkt-num bytes |
-| 2.2.3 | `ql_hp_remove()` | identical operation (XOR is self-inverse) |
+| 2.2.2 [x] | `ql_hp_protect()` | XOR mask into first-byte bits and pkt-num bytes |
+| 2.2.3 [x] | `ql_hp_remove()` | identical operation (XOR is self-inverse) |
 
 **Test gate 2.2:** Use RFC 9001 Appendix B sample.  Protect then remove, verify original bytes recovered byte-for-byte.
 

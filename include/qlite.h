@@ -97,7 +97,7 @@ extern "C" {
  * 16 Table 1.
  */
 typedef uint64_t ql_varint_t;
-#define QL_VARINT_MAX      UINT64_C(4611686018427387903)  /* 2^62 − 1  §16 */
+#define QL_VARINT_MAX      UINT64_C(4611686018427387903)  /* 2^62 − 1  16 */
 #define QL_VARINT_1B_MAX   UINT64_C(63)
 #define QL_VARINT_2B_MAX   UINT64_C(16383)
 #define QL_VARINT_4B_MAX   UINT64_C(1073741823)
@@ -113,6 +113,12 @@ typedef uint64_t ql_stream_id_t;
 
 /* Packet number 12.3 — 62-bit per-packet-number-space counter */
 typedef uint64_t ql_pkt_num_t;
+
+/*
+ * Sentinel "no packet number yet received" value.
+ * Must not collide with any valid packet number (0 .. 2^62-1).
+ */
+#define QL_PKT_NUM_NONE    UINT64_MAX
 
 /* Connection ID 5.1 — opaque, 1–20 bytes; len=0 means zero-length CID */
 #define QL_CID_MAX_LEN  20
@@ -167,6 +173,11 @@ typedef struct {
 
 /* 12.1 / RFC 9001 5.3 — AEAD tag is always 16 bytes */
 #define QL_AEAD_TAG_LEN  16
+
+/* RFC 9001 5.4.2 — Header-protection sample is always 16 bytes,
+ * taken starting 4 bytes after the start of the encoded packet number */
+#define QL_HP_SAMPLE_LEN     16
+#define QL_HP_SAMPLE_OFFSET   4   /* bytes after start of pkt-num field */
 
 /* Server limits */
 #define QL_SERVER_MAX_CONNS    1024
@@ -629,13 +640,37 @@ typedef struct {
  * @link: https://www.rfc-editor.org/rfc/rfc9000.html?#name-packet-formats
  */
 typedef enum {
-    QL_PKT_VERSION_NEGOTIATION = 0,  /* §17.2.1 — special, no type bits */
-    QL_PKT_INITIAL             = 1,  /* §17.2.2 — long header, type 0x00 */
-    QL_PKT_0RTT                = 2,  /* §17.2.3 — long header, type 0x01 */
-    QL_PKT_HANDSHAKE           = 3,  /* §17.2.4 — long header, type 0x02 */
-    QL_PKT_RETRY               = 4,  /* §17.2.5 — long header, type 0x03 */
-    QL_PKT_1RTT                = 5,  /* §17.3.1 — short header */
+    QL_PKT_VERSION_NEGOTIATION = 0,  /* 17.2.1 — special, no type bits */
+    QL_PKT_INITIAL             = 1,  /* 17.2.2 — long header, type 0x00 */
+    QL_PKT_0RTT                = 2,  /* 17.2.3 — long header, type 0x01 */
+    QL_PKT_HANDSHAKE           = 3,  /* 17.2.4 — long header, type 0x02 */
+    QL_PKT_RETRY               = 4,  /* 17.2.5 — long header, type 0x03 */
+    QL_PKT_1RTT                = 5,  /* 17.3.1 — short header */
 } ql_pkt_type_t;
+
+/* Long-header first-byte bit masks 17.2 */
+#define QL_LONG_HDR_FORM           0x80u  /* bit 7 = 1 → long header */
+#define QL_LONG_HDR_FIXED_BIT      0x40u  /* MUST be 1 */
+#define QL_LONG_HDR_TYPE_MASK      0x30u  /* bits 4-5: long-header packet type */
+#define QL_LONG_HDR_TYPE_SHIFT     4
+#define QL_LONG_HDR_RESERVED_MASK  0x0Cu  /* MUST be 0 after header protection */
+#define QL_LONG_HDR_PKT_NUM_MASK   0x03u  /* encoded pkt-num length − 1 */
+
+/* Short (1-RTT) header first-byte bit masks 17.3 */
+#define QL_SHORT_HDR_FORM          0x00u  /* bit 7 = 0 → short header */
+#define QL_SHORT_HDR_FIXED_BIT     0x40u  /* MUST be 1 */
+#define QL_SHORT_HDR_SPIN_BIT      0x20u  /* 17.4 latency spin */
+#define QL_SHORT_HDR_RESERVED_MASK 0x18u  /* MUST be 0 after header protection */
+#define QL_SHORT_HDR_KEY_PHASE     0x04u  /* key-update phase bit RFC 9001 5.4 */
+#define QL_SHORT_HDR_PKT_NUM_MASK  0x03u  /* encoded pkt-num length − 1 */
+
+/* Test first byte: long or short? */
+#define QL_PKT_IS_LONG(first_byte)  (((first_byte) & 0x80u) != 0)
+#define QL_PKT_IS_SHORT(first_byte) (((first_byte) & 0x80u) == 0)
+
+/* 17.1 — Maximum packet-number field length in bytes */
+#define QL_PKT_NUM_MAX_ENCODED_LEN  4
+
 /* Long header (Initial, 0-RTT, Handshake, Retry) 17.2 */
 /*
     Long headers are used for packets that are sent prior to the 
@@ -872,12 +907,12 @@ uint64_t ql_now_ms(void) {
 }
 
 // /* Write n bytes of val into buf in big-endian order. */
-// static void ql__write_be(uint8_t *buf, uint64_t val, int n) {
-//     for (int i = n - 1; i >= 0; i--) {
-//         buf[i] = (uint8_t)(val & 0xFF);
-//         val >>= 8;
-//     }
-// }
+static void ql__write_be(uint8_t *buf, uint64_t val, int n) {
+    for (int i = n - 1; i >= 0; i--) {
+        buf[i] = (uint8_t)(val & 0xFF);
+        val >>= 8;
+    }
+}
 
 /* Bounds-checked varint read from buf[pos..len], advance pos. */
 static int ql__read_varint(const uint8_t *buf, size_t *pos, size_t len, ql_varint_t *out) {
@@ -959,12 +994,12 @@ int  ql_frame_encode(const ql_frame_t *frame, uint8_t *buf, size_t cap){
             WV(f->range_count);
             WV(f->first_ack_range);
 
-            /* §19.3.1 — each extra range is a (Gap, ACK Range Length) pair */
+            /* 19.3.1 — each extra range is a (Gap, ACK Range Length) pair */
             for (uint64_t i = 0; i < f->range_count && i < QL_ACK_RANGE_MAX; i++) {
                 /* Gap = number of unacked packets between this range and the previous.
                 * On the wire: Gap is (actual_gap - 1), ACK Range is (count - 1)     */
                 WV(f->ranges[i].largest);   /* gap value already computed by caller   */
-                WV(f->ranges[i].count - 1); /* count - 1 per §19.3.1                  */
+                WV(f->ranges[i].count - 1); /* count - 1 per 19.3.1                  */
             }
 
             /* ECN counts only present in ACK_ECN (0x03) */
@@ -1205,7 +1240,7 @@ int  ql_frame_decode(const uint8_t *buf, size_t len, ql_frame_t *out){
             f->data = buf + pos;      /* zero-copy */
             pos += (size_t)f->length;
         } else {
-            /* No LEN bit: data runs to end of the enclosing packet §19.8 */
+            /* No LEN bit: data runs to end of the enclosing packet 19.8 */
             f->length = (uint64_t)(len - pos);
             f->data   = buf + pos;
             pos       = len;
@@ -1249,12 +1284,12 @@ int  ql_frame_decode(const uint8_t *buf, size_t len, ql_frame_t *out){
         ql_frame_new_cid_t *f = &out->u.new_cid;
         RV(f->sequence_num);
         RV(f->retire_prior_to);
-        /* CID length is a plain uint8_t on the wire, NOT a varint §19.15 */
+        /* CID length is a plain uint8_t on the wire, NOT a varint 19.15 */
         if (pos >= len) return QLITE_ERR_BUF;
         f->cid.len = buf[pos++];
         if (f->cid.len > QL_CID_MAX_LEN) return QLITE_ERR_PROTO;
         RB(f->cid.data, f->cid.len);
-        /* Stateless Reset Token: always exactly 16 bytes §19.15 */
+        /* Stateless Reset Token: always exactly 16 bytes 19.15 */
         RB(f->stateless_reset_token.data, QL_RESET_TOKEN_LEN);
         return (int)pos;
     }
@@ -1592,7 +1627,98 @@ int  ql_hp_remove(const ql_keys_t *key, uint8_t *hdr, size_t hdr_len,
 
 int  ql_pkt_encode(const ql_pkt_hdr_t *hdr, const ql_keys_t *key,
                     const uint8_t *payload, size_t payload_len,
-                    uint8_t *out, size_t cap);
+                    uint8_t *out, size_t cap)
+{
+    if(!hdr || !key || !out) return QLITE_ERR_ARGS;
+    /* header -> ql_aead_seal() -> ql_hp_protect() */
+    size_t pos = 0;
+
+    if(hdr->is_long){
+        /* long header*/
+        const ql_long_hdr_t *lh = &hdr->h.lhdr;
+        // first byte
+        if(pos >= cap) return QLITE_ERR_BUF;
+        out[pos++] = lh->first_byte;
+
+        if(pos + 4 > cap) return QLITE_ERR_BUF;
+        ql__write_be(out + pos, lh->version, 4);
+        pos += 4;
+
+        /* DCID LENGTH + DCID*/
+        if(pos + 1 + lh->dst_cid.len > cap) return QLITE_ERR_BUF;
+        out[pos++] = lh->dst_cid.len;
+        memcpy(out + pos, lh->dst_cid.data, lh->dst_cid.len);
+        pos += lh->dst_cid.len;
+
+        /* SCID length + SCID */
+        if (pos + 1 + lh->src_cid.len > cap) return QLITE_ERR_BUF;
+        out[pos++] = lh->src_cid.len;
+        memcpy(out + pos, lh->src_cid.data, lh->src_cid.len);
+        pos += lh->src_cid.len;
+
+        /* Initial: token length + token */
+        if (lh->pkt_type == QL_PKT_INITIAL) {
+            int vn = ql_varint_encode(out + pos, cap - pos, lh->token_len);
+            if (vn < 0) return QLITE_ERR_BUF;
+            pos += (size_t)vn;
+            if (pos + lh->token_len > cap) return QLITE_ERR_BUF;
+            memcpy(out + pos, lh->token, lh->token_len);
+            pos += lh->token_len;
+        }
+
+        /* Length (payload + AEAD tag), leave space: encode as 2-byte varint */
+        size_t length_field_pos = pos;
+        uint64_t pkt_payload_len = payload_len + QL_AEAD_TAG_LEN;
+        if (pkt_payload_len > QL_VARINT_2B_MAX) return QLITE_ERR_BUF;
+        if (pos + 2 > cap) return QLITE_ERR_BUF;
+        /* Always encode as 2-byte varint so the field is fixed-width */
+        out[pos]     = 0x40 | (uint8_t)((pkt_payload_len >> 8) & 0x3F);
+        out[pos + 1] = (uint8_t)(pkt_payload_len & 0xFF);
+        pos += 2;
+
+        /* Packet number — always encode as minimum width */
+        size_t pn_pos = pos;
+        int pn_len = ql_pkt_num_encode(out + pos, lh->pkt_num,
+                                        QL_PKT_NUM_NONE /* simplified: chunk 2 passes largest_acked */);
+        if (pn_len < 0) return pn_len;
+        pos += (size_t)pn_len;
+
+        /* Patch first byte's pkt-num-length field (bits 0–1) */
+        out[length_field_pos - 1 /* first_byte */] =
+            (out[0] & ~QL_LONG_HDR_PKT_NUM_MASK) | (uint8_t)(pn_len - 1);
+        (void)pn_pos;
+
+    }else{
+        /* short header*/
+        const ql_short_hdr_t *sh = &hdr->h.shdr;
+        if(pos >= cap) return QLITE_ERR_BUF;
+        out[pos++] = sh->first_byte;
+
+        /* DCID (Length known from the conn, no length prefix 17.3)*/
+        if(pos + sh->dst_cid.len > cap) return QLITE_ERR_BUF;
+        memcpy(out + pos, sh->dst_cid.data, sh->dst_cid.len);
+        pos += sh->dst_cid.len;
+
+        /* pkt num*/
+        int pn_len = ql_pkt_num_decode(out + pos, sh->pkt_num, QL_PKT_NUM_NONE);
+        if(pn_len < 0) return pn_len;
+        pos += (size_t)pn_len;
+    }
+
+    if(pos + payload_len + QL_AEAD_TAG_LEN > cap) return QLITE_ERR_BUF;
+
+    int sealed = ql_aead_seal(key, 0, out, pos, payload, payload_len, out+pos, cap-pos);
+    if(sealed < 0) return sealed;
+    pos += (size_t)sealed;
+
+    const uint8_t *sample = out + pos - QL_AEAD_TAG_LEN - payload_len + QL_HP_SAMPLE_OFFSET;
+
+    int hp = ql_hp_protect(key, out, pos, sample);
+    if(hp < 0) return hp;
+
+    return (int)pos;
+}
+
 int  ql_pkt_decode(const uint8_t *buf, size_t len, const ql_keys_t *key,
                     ql_pkt_hdr_t *hdr_out, uint8_t *payload_out, size_t cap);
 
@@ -1715,17 +1841,17 @@ int ql_tp_decode(const uint8_t *buf, size_t len, ql_transport_params_t *out) {
                 break;
             case QL_TP_ACK_DELAY_EXPONENT:
                 if (ql_varint_decode(buf + pos, tp_len, &v) < 0) return QLITE_ERR_PROTO;
-                if (v > 20) return QLITE_ERR_PROTO; /* §18.2: MUST be <= 20 */
+                if (v > 20) return QLITE_ERR_PROTO; /* 18.2: MUST be <= 20 */
                 out->ack_delay_exponent = v;
                 break;
             case QL_TP_MAX_ACK_DELAY:
                 if (ql_varint_decode(buf + pos, tp_len, &v) < 0) return QLITE_ERR_PROTO;
-                if (v >= (UINT64_C(1) << 14)) return QLITE_ERR_PROTO; /* §18.2 */
+                if (v >= (UINT64_C(1) << 14)) return QLITE_ERR_PROTO; /* 18.2 */
                 out->max_ack_delay_ms = v;
                 break;
             case QL_TP_ACTIVE_CONNECTION_ID_LIMIT:
                 if (ql_varint_decode(buf + pos, tp_len, &v) < 0) return QLITE_ERR_PROTO;
-                if (v < 2) return QLITE_ERR_PROTO; /* §18.2: MUST be >= 2 */
+                if (v < 2) return QLITE_ERR_PROTO; /* 18.2: MUST be >= 2 */
                 out->active_cid_limit = v;
                 break;
             case QL_TP_DISABLE_ACTIVE_MIGRATION:
@@ -1753,7 +1879,7 @@ int ql_tp_decode(const uint8_t *buf, size_t len, ql_transport_params_t *out) {
                 out->has_retry_src_cid = true;
                 break;
             default:
-                /* §7.4.2 — unknown TP IDs MUST be ignored */
+                /* 7.4.2 — unknown TP IDs MUST be ignored */
                 break;
         }
         pos = val_end;
