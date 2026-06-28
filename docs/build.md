@@ -44,9 +44,9 @@ No crypto, no connections, no state machines — just serialisation.
 
 | Sub-chunk | Symbol(s) | Notes |
 |---|---|---|
-| 1.2.1 | `ql_varint_encoded_len()` | 1/2/4/8 bytes, no writes |
-| 1.2.2 | `ql_varint_encode()` | writes 2-MSB prefix + value |
-| 1.2.3 | `ql_varint_decode()` | reads prefix, returns bytes consumed |
+| 1.2.1 [x]| `ql_varint_encoded_len()` | 1/2/4/8 bytes, no writes |
+| 1.2.2 [x]| `ql_varint_encode()` | writes 2-MSB prefix + value |
+| 1.2.3 [x]| `ql_varint_decode()` | reads prefix, returns bytes consumed |
 
 **Test gate 1.1:** Round-trip all four length boundaries (`0`, `63`, `64`, `16383`, `16384`, `1073741823`, `1073741824`, `QL_VARINT_MAX`).  Verify decode rejects truncated input.
 
@@ -56,8 +56,8 @@ No crypto, no connections, no state machines — just serialisation.
 
 | Sub-chunk | Symbol(s) | Notes |
 |---|---|---|
-| 1.3.1 | `ql_pkt_num_encode()` | smallest k-bit truncation given largest_acked |
-| 1.3.2 | `ql_pkt_num_decode()` | reconstruct full 62-bit from truncated + largest_pn |
+| 1.3.1 [x] | `ql_pkt_num_encode()` | smallest k-bit truncation given largest_acked |
+| 1.3.2 [x] | `ql_pkt_num_decode()` | reconstruct full 62-bit from truncated + largest_pn |
 
 **Test gate 1.2:** Use the RFC Appendix A.2 / A.3 sample vectors.  Verify edge cases: wrap-around at 2^62, pn=0 with no prior.
 
@@ -80,8 +80,8 @@ Order within this chunk matters — simpler frames first, STREAM last.
 | 1.3.9 | PATH_CHALLENGE, PATH_RESPONSE | 8-byte data blob |
 | 1.3.10 | CONNECTION_CLOSE (0x1C), CONNECTION_CLOSE_APP (0x1D) | reason phrase |
 | 1.3.11 | HANDSHAKE_DONE | zero-field; server→client only |
-| 1.3.12 | `ql_frame_encode()` dispatch | switch over `ql_frame_t.type` |
-| 1.3.13 | `ql_frame_decode()` dispatch | read type varint, route to handler |
+| 1.3.12 [x] | `ql_frame_encode()` dispatch | switch over `ql_frame_t.type` |
+| 1.3.13 [x] | `ql_frame_decode()` dispatch | read type varint, route to handler |
 
 **Test gate 1.3:** Encode every frame type with known values, decode the output, compare field-by-field.  Test truncated-buffer rejection for each type.  Test unknown frame type returns `QLITE_ERR_PROTO`.
 
@@ -91,8 +91,8 @@ Order within this chunk matters — simpler frames first, STREAM last.
 
 | Sub-chunk | Symbol(s) | Notes |
 |---|---|---|
-| 1.4.1 | `ql_tp_encode()` | iterate known IDs, write TLV entries |
-| 1.4.2 | `ql_tp_decode()` | parse TLV loop, unknown IDs silently skipped §7.4.2 |
+| 1.4.1 [x] | `ql_tp_encode()` | iterate known IDs, write TLV entries |
+| 1.4.2 [x] | `ql_tp_decode()` | parse TLV loop, unknown IDs silently skipped §7.4.2 |
 | 1.4.3 | Default value injection | fill in RFC defaults for absent params |
 
 **Test gate 1.4:** Encode a fully-populated `ql_transport_params_t`, decode into a fresh struct, compare all fields.  Verify unknown ID (e.g. 0xFF) is skipped without error.  Verify duplicate ID triggers `QLITE_ERR_PROTO`.
