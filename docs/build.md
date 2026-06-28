@@ -103,10 +103,10 @@ Order within this chunk matters — simpler frames first, STREAM last.
 
 | Sub-chunk | Symbol(s) | Notes |
 |---|---|---|
-| 1.5.1 | `ql_udp_socket()` | create, bind, set `O_NONBLOCK` |
-| 1.5.2 | `ql_udp_send()` | `sendto` wrapper, maps EAGAIN → `QLITE_ERR_WOULDBLOCK` |
-| 1.5.3 | `ql_udp_recv()` | `recvfrom` wrapper, maps EAGAIN → `QLITE_ERR_AGAIN` |
-| 1.5.4 | `ql_now_ms()` | `clock_gettime(CLOCK_MONOTONIC)` → ms |
+| 1.5.1 [x]| `ql_udp_socket()` | create, bind, set `O_NONBLOCK` |
+| 1.5.2 [x]| `ql_udp_send()` | `sendto` wrapper, maps EAGAIN → `QLITE_ERR_WOULDBLOCK` |
+| 1.5.3 [x]| `ql_udp_recv()` | `recvfrom` wrapper, maps EAGAIN → `QLITE_ERR_AGAIN` |
+| 1.5.4 [x]| `ql_now_ms()` | `clock_gettime(CLOCK_MONOTONIC)` → ms |
 
 **Test gate 1.5:** Open two sockets on loopback, send a datagram from one to the other, recv it, compare bytes.  Verify non-blocking behaviour (recv on empty socket → `QLITE_ERR_AGAIN`).
 
