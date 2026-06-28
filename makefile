@@ -1,6 +1,7 @@
 CC = gcc
 CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -Werror -g \
-          -fsanitize=address,undefined
+          -fsanitize=address,undefined \
+		  -lssl -lcrypto
 INCLUDES := -Iinclude
 
 SRC := $(wildcard src/*.c)
