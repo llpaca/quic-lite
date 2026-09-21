@@ -3848,6 +3848,124 @@ static void ql__on_possible_migration(ql_conn_t *conn, const struct sockaddr_sto
                                       socklen_t src_addrlen, uint64_t now_ms);
 static void ql__cid_issue_new(ql_conn_t *conn, uint64_t now_ms);
 
+/*
+ * ql__send_level_pkt — encrypt `payload` as one packet at `level`, enqueue
+ * the resulting datagram, and record sent-packet bookkeeping that later
+ * phases (retransmission, congestion control) will build on.
+ */
+static int ql__send_level_pkt_to(ql_conn_t *conn, ql_enc_level_t level, const uint8_t *payload,
+                                 size_t payload_len, bool ack_eliciting, uint32_t frame_flags,
+                                 uint64_t now_ms, const struct sockaddr_storage *dest,
+                                 socklen_t dest_len, int *out_idx) {
+    ql_keys_t *wk = &conn->keys[level].write;
+    if (!wk->is_set) {
+        return QLITE_ERR_CRYPTO;
+    }
+    if (conn->send_queue.count >= QL_MAX_COALESCE_PKTS) {
+        return QLITE_ERR_BUF;
+    }
+
+    /* 3.6.2 — anti-amplification gate: a server that hasn't validated the
+     * client's address may not send more than 3x what it has received. */
+    if (conn->role == QL_ROLE_SERVER && !conn->addr_valid.validated) {
+        uint64_t budget = conn->addr_valid.bytes_received * QL_AMPLIFICATION_FACTOR;
+        if (conn->addr_valid.bytes_sent + payload_len + QL_AEAD_TAG_LEN + 64 > budget) {
+            return QLITE_ERR_WOULDBLOCK;
+        }
+    }
+
+    ql_pn_space_t space  = ql__level_to_pn_space(level);
+    ql_pkt_num_t pn      = conn->next_pn[space];
+
+    ql_pkt_hdr_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+
+    if (level == QL_ENC_LEVEL_APP) {
+        hdr.is_long          = false;
+        ql_short_hdr_t *sh   = &hdr.h.shdr;
+        sh->first_byte       = QL_SHORT_HDR_FIXED_BIT | (conn->spin_bit ? QL_SHORT_HDR_SPIN_BIT : 0) |
+                          (conn->key_update.current_phase ? QL_SHORT_HDR_KEY_PHASE : 0);
+        sh->dst_cid = conn->remote_cid;
+        sh->pkt_num = pn;
+    } else {
+        hdr.is_long        = true;
+        ql_long_hdr_t *lh  = &hdr.h.lhdr;
+        uint8_t type_bits;
+        switch (level) {
+            case QL_ENC_LEVEL_INITIAL:   lh->pkt_type = QL_PKT_INITIAL;   type_bits = 0; break;
+            case QL_ENC_LEVEL_EARLY_DATA: lh->pkt_type = QL_PKT_0RTT;      type_bits = 1; break;
+            case QL_ENC_LEVEL_HANDSHAKE: lh->pkt_type = QL_PKT_HANDSHAKE; type_bits = 2; break;
+            default: return QLITE_ERR_ARGS;
+        }
+        lh->first_byte = (uint8_t)(QL_LONG_HDR_FORM | QL_LONG_HDR_FIXED_BIT |
+                                   (type_bits << QL_LONG_HDR_TYPE_SHIFT));
+        lh->version = QL_VERSION_1;
+        lh->dst_cid = conn->remote_cid;
+        lh->src_cid = conn->local_cid;
+        lh->pkt_num = pn;
+        if (lh->pkt_type == QL_PKT_INITIAL && conn->token.len > 0) {
+            memcpy(lh->token, conn->token.data, conn->token.len);
+            lh->token_len = conn->token.len;
+        }
+    }
+
+    uint8_t out_buf[QL_PATH_MTU_ETHERNET + 64];
+    int n = ql_pkt_encode(&hdr, wk, payload, payload_len, out_buf, sizeof(out_buf));
+    if (n < 0) {
+        return n;
+    }
+
+    ql_datagram_t *dg = &conn->send_queue.datagrams[conn->send_queue.tail];
+    memcpy(dg->data, out_buf, (size_t)n);
+    dg->len      = (size_t)n;
+    dg->dest     = *dest;
+    dg->dest_len = dest_len;
+    conn->send_queue.tail = (conn->send_queue.tail + 1) % QL_MAX_COALESCE_PKTS;
+    conn->send_queue.count++;
+
+    conn->next_pn[space] = pn + 1;
+
+    int idx                              = conn->sent_pkt_tail;
+    conn->sent_pkts[idx].pkt_num         = pn;
+    conn->sent_pkts[idx].pn_space        = space;
+    conn->sent_pkts[idx].sent_at_ms      = now_ms;
+    conn->sent_pkts[idx].in_flight_bytes = (size_t)n;
+    conn->sent_pkts[idx].ack_eliciting   = ack_eliciting;
+    conn->sent_pkts[idx].in_flight       = ack_eliciting;
+    conn->sent_pkts[idx].is_lost         = false;
+    conn->sent_pkts[idx].is_acked        = false;
+    conn->sent_pkts[idx].frame_flags     = frame_flags;
+    conn->sent_pkt_tail                  = (conn->sent_pkt_tail + 1) % QL_SENT_PKT_MAX;
+    if (conn->sent_pkt_count < QL_SENT_PKT_MAX) {
+        conn->sent_pkt_count++;
+    }else{
+        /* Ring is full: the slot we just overwrote (== old head) is now
+         * the newest entry, so the true oldest entry moved forward one. */
+        conn->sent_pkt_head = (conn->sent_pkt_head + 1) % QL_SENT_PKT_MAX;
+    }
+
+    conn->bytes_sent_total += (uint64_t)n;
+    conn->pkts_sent++;
+    conn->addr_valid.bytes_sent += (uint64_t)n;
+
+    if (out_idx) {
+        *out_idx = idx;
+    }
+
+    return n;
+}
+
+/* Thin wrapper: sends to the currently active path, as almost every caller
+ * wants. ql__send_level_pkt_to exists for path validation / migration
+ * probes (chunk 6.2/6.3), which must target a not-yet-active address. */
+static int ql__send_level_pkt(ql_conn_t *conn, ql_enc_level_t level, const uint8_t *payload,
+                              size_t payload_len, bool ack_eliciting, uint32_t frame_flags,
+                              uint64_t now_ms, int *out_idx) {
+    return ql__send_level_pkt_to(conn, level, payload, payload_len, ack_eliciting, frame_flags,
+                                 now_ms, &conn->active_path.peer_addr, conn->active_path.peer_addrlen,
+                                 out_idx);
+}
+
 static int ql__process_frames(ql_conn_t *conn, ql_enc_level_t level, const uint8_t *payload,
                               size_t payload_len, uint64_t now_ms,
                               const struct sockaddr_storage *src_addr, socklen_t src_addrlen,
@@ -4120,124 +4238,6 @@ static int ql__process_frames(ql_conn_t *conn, ql_enc_level_t level, const uint8
         *out_ack_eliciting = ack_eliciting;
     }
     return (int)pos;
-}
-
-/*
- * ql__send_level_pkt — encrypt `payload` as one packet at `level`, enqueue
- * the resulting datagram, and record sent-packet bookkeeping that later
- * phases (retransmission, congestion control) will build on.
- */
-static int ql__send_level_pkt_to(ql_conn_t *conn, ql_enc_level_t level, const uint8_t *payload,
-                                 size_t payload_len, bool ack_eliciting, uint32_t frame_flags,
-                                 uint64_t now_ms, const struct sockaddr_storage *dest,
-                                 socklen_t dest_len, int *out_idx) {
-    ql_keys_t *wk = &conn->keys[level].write;
-    if (!wk->is_set) {
-        return QLITE_ERR_CRYPTO;
-    }
-    if (conn->send_queue.count >= QL_MAX_COALESCE_PKTS) {
-        return QLITE_ERR_BUF;
-    }
-
-    /* 3.6.2 — anti-amplification gate: a server that hasn't validated the
-     * client's address may not send more than 3x what it has received. */
-    if (conn->role == QL_ROLE_SERVER && !conn->addr_valid.validated) {
-        uint64_t budget = conn->addr_valid.bytes_received * QL_AMPLIFICATION_FACTOR;
-        if (conn->addr_valid.bytes_sent + payload_len + QL_AEAD_TAG_LEN + 64 > budget) {
-            return QLITE_ERR_WOULDBLOCK;
-        }
-    }
-
-    ql_pn_space_t space  = ql__level_to_pn_space(level);
-    ql_pkt_num_t pn      = conn->next_pn[space];
-
-    ql_pkt_hdr_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-
-    if (level == QL_ENC_LEVEL_APP) {
-        hdr.is_long          = false;
-        ql_short_hdr_t *sh   = &hdr.h.shdr;
-        sh->first_byte       = QL_SHORT_HDR_FIXED_BIT | (conn->spin_bit ? QL_SHORT_HDR_SPIN_BIT : 0) |
-                          (conn->key_update.current_phase ? QL_SHORT_HDR_KEY_PHASE : 0);
-        sh->dst_cid = conn->remote_cid;
-        sh->pkt_num = pn;
-    } else {
-        hdr.is_long        = true;
-        ql_long_hdr_t *lh  = &hdr.h.lhdr;
-        uint8_t type_bits;
-        switch (level) {
-            case QL_ENC_LEVEL_INITIAL:   lh->pkt_type = QL_PKT_INITIAL;   type_bits = 0; break;
-            case QL_ENC_LEVEL_EARLY_DATA: lh->pkt_type = QL_PKT_0RTT;      type_bits = 1; break;
-            case QL_ENC_LEVEL_HANDSHAKE: lh->pkt_type = QL_PKT_HANDSHAKE; type_bits = 2; break;
-            default: return QLITE_ERR_ARGS;
-        }
-        lh->first_byte = (uint8_t)(QL_LONG_HDR_FORM | QL_LONG_HDR_FIXED_BIT |
-                                   (type_bits << QL_LONG_HDR_TYPE_SHIFT));
-        lh->version = QL_VERSION_1;
-        lh->dst_cid = conn->remote_cid;
-        lh->src_cid = conn->local_cid;
-        lh->pkt_num = pn;
-        if (lh->pkt_type == QL_PKT_INITIAL && conn->token.len > 0) {
-            memcpy(lh->token, conn->token.data, conn->token.len);
-            lh->token_len = conn->token.len;
-        }
-    }
-
-    uint8_t out_buf[QL_PATH_MTU_ETHERNET + 64];
-    int n = ql_pkt_encode(&hdr, wk, payload, payload_len, out_buf, sizeof(out_buf));
-    if (n < 0) {
-        return n;
-    }
-
-    ql_datagram_t *dg = &conn->send_queue.datagrams[conn->send_queue.tail];
-    memcpy(dg->data, out_buf, (size_t)n);
-    dg->len      = (size_t)n;
-    dg->dest     = *dest;
-    dg->dest_len = dest_len;
-    conn->send_queue.tail = (conn->send_queue.tail + 1) % QL_MAX_COALESCE_PKTS;
-    conn->send_queue.count++;
-
-    conn->next_pn[space] = pn + 1;
-
-    int idx                              = conn->sent_pkt_tail;
-    conn->sent_pkts[idx].pkt_num         = pn;
-    conn->sent_pkts[idx].pn_space        = space;
-    conn->sent_pkts[idx].sent_at_ms      = now_ms;
-    conn->sent_pkts[idx].in_flight_bytes = (size_t)n;
-    conn->sent_pkts[idx].ack_eliciting   = ack_eliciting;
-    conn->sent_pkts[idx].in_flight       = ack_eliciting;
-    conn->sent_pkts[idx].is_lost         = false;
-    conn->sent_pkts[idx].is_acked        = false;
-    conn->sent_pkts[idx].frame_flags     = frame_flags;
-    conn->sent_pkt_tail                  = (conn->sent_pkt_tail + 1) % QL_SENT_PKT_MAX;
-    if (conn->sent_pkt_count < QL_SENT_PKT_MAX) {
-        conn->sent_pkt_count++;
-    }else{
-        /* Ring is full: the slot we just overwrote (== old head) is now
-         * the newest entry, so the true oldest entry moved forward one. */
-        conn->sent_pkt_head = (conn->sent_pkt_head + 1) % QL_SENT_PKT_MAX;
-    }
-
-    conn->bytes_sent_total += (uint64_t)n;
-    conn->pkts_sent++;
-    conn->addr_valid.bytes_sent += (uint64_t)n;
-
-    if (out_idx) {
-        *out_idx = idx;
-    }
-
-    return n;
-}
-
-/* Thin wrapper: sends to the currently active path, as almost every caller
- * wants. ql__send_level_pkt_to exists for path validation / migration
- * probes (chunk 6.2/6.3), which must target a not-yet-active address. */
-static int ql__send_level_pkt(ql_conn_t *conn, ql_enc_level_t level, const uint8_t *payload,
-                              size_t payload_len, bool ack_eliciting, uint32_t frame_flags,
-                              uint64_t now_ms, int *out_idx) {
-    return ql__send_level_pkt_to(conn, level, payload, payload_len, ack_eliciting, frame_flags,
-                                 now_ms, &conn->active_path.peer_addr, conn->active_path.peer_addrlen,
-                                 out_idx);
 }
 
 /* -------------------------------------------------------------------------
