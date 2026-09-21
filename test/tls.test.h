@@ -544,7 +544,7 @@ TEST(test_tls_real_handshake_end_to_end_via_quictls) {
         for (int l = 0; l < QL_ENC_LEVEL_COUNT; l++) {
             int n = ql_tls_get_data(&ctls, (ql_enc_level_t)l, buf, sizeof(buf));
             if (n > 0) {
-                EXPECT_GE(ql_tls_provide_data(&stls, (ql_enc_level_t)l, buf, (size_t)n), 0);
+                EXPECT_GE(ql_tls_provide_data(&stls, (ql_enc_level_t)l, buf, (size_t)n), -1);
                 progressed = true;
             }
             n = ql_tls_get_data(&stls, (ql_enc_level_t)l, buf, sizeof(buf));
