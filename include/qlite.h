@@ -904,11 +904,11 @@ typedef struct {
 
 typedef struct {
     uint8_t buf[QL_CRYPTO_BUF_SIZE];
-    uint64_t rx_offset; /* next expected byte from peer */
-    uint64_t tx_offset; /* next byte offset to send to peer */
+    uint64_t rx_offset;      /* next expected byte from peer */
+    uint64_t tx_offset;      /* total bytes ever staged here by ql_tls_get_data */
     uint64_t tx_sent_offset; /* of those, how many have gone out in CRYPTO frames */
     uint64_t tx_acked_offset; /* of those, how many the peer has confirmed (chunk 5.1) */
-    bool has_data;      /* non-empty */
+    bool has_data;           /* non-empty */
 } ql_crypto_buf_t;
 
 /*
@@ -1277,6 +1277,7 @@ struct ql_conn {
     ql_timer_t timer_idle;                   /* 10.1 */
     ql_timer_t timer_drain;                  /* 10.2.2 */
     ql_timer_t timer_ack[QL_PN_SPACE_COUNT]; /* 13.2.1 — per space */
+    uint64_t last_activity_ms; /* last time we sent or received anything (10.1) */
 
     /* ---- Close state 10.2 ---- */
     bool closing;
@@ -1308,6 +1309,32 @@ struct ql_conn {
     /* ---- Opaque user pointer ---- */
     void *user;
 };
+
+/*
+ * ql_listener_t — a server's shared UDP socket plus a registry of the
+ * connections it has demuxed onto it (chunk 7.1). One socket serves every
+ * connection; ql_conn_t.fd for a server-side connection just aliases this
+ * fd for sending — inbound demux happens here, not in ql_conn_tick.
+ */
+#define QL_LISTENER_MAX_CONNS 256
+#define QL_LISTENER_ACCEPT_QUEUE 64
+
+typedef struct {
+    int fd;
+    ql_config_t cfg_template;
+    void *ssl_ctx;
+    uint8_t reset_secret[32]; /* HMAC-ish key for deterministic stateless reset tokens (10.3) */
+
+    ql_conn_t *conns[QL_LISTENER_MAX_CONNS]; /* all connections demuxed onto this socket */
+    int conn_count;
+
+    /* Connections whose handshake has just confirmed, waiting to be
+     * handed to the app via qlite_accept(). */
+    ql_conn_t *accept_queue[QL_LISTENER_ACCEPT_QUEUE];
+    int accept_head;
+    int accept_tail;
+    int accept_count;
+} ql_listener_t;
 
 /* One outgoing-handshake-data buffer per encryption level. OpenSSL's
  * add_handshake_data callback PUSHES bytes to us; ql_tls_get_data DRAINS
@@ -1402,10 +1429,22 @@ static const SSL_QUIC_METHOD QL_QUIC_METHOD = {
  * PUBLIC API
  */
 int ql_varint_encoded_len(ql_varint_t val) {
-    if (val <= 63) return 1;
-    if (val <= 16383) return 2;
-    if (val <= 1073741823ULL) return 4;
-    if (val <= 4611686018427387903ULL) return 8;
+    if (val <= 63) {
+        return 1;
+    }
+
+    if (val <= 16383) {
+        return 2;
+    }
+
+    if (val <= 1073741823ULL) {
+        return 4;
+    }
+
+    if (val <= 4611686018427387903ULL) {
+        return 8;
+    }
+
     return -1; /* invalid QUIC varint */
 } /* returns 1/2/4/8 */
 /*
@@ -2593,11 +2632,15 @@ int ql_pkt_encode(const ql_pkt_hdr_t *hdr, const ql_keys_t *key, const uint8_t *
  */
 int ql_pkt_decode(const uint8_t *buf, size_t len, const ql_keys_t *key, ql_pkt_hdr_t *hdr_out,
                   uint8_t *payload_out, size_t cap) {
-    if(!buf || !key || !key->is_set || !hdr_out || !payload_out) return QLITE_ERR_ARGS;
-    if(len < 2) return QLITE_ERR_BUF;
+    if (!buf || !key || !key->is_set || !hdr_out || !payload_out) {
+        return QLITE_ERR_ARGS;
+    }
+    if (len < 2) {
+        return QLITE_ERR_BUF;
+    }
 
     uint8_t first_byte_raw = buf[0];
-    bool is_long           = QL_PKT_IS_LONG(first_byte_raw);
+    bool is_long            = QL_PKT_IS_LONG(first_byte_raw);
 
     /* Short header carries no DCID length; caller supplies the expected
      * length via hdr_out before we wipe the struct. */
@@ -3191,6 +3234,7 @@ static int ql__fill_random(uint8_t *buf, size_t len) {
     }
     return QLITE_OK;
 }
+
 void ql_cid_generate(ql_cid_t *cid, uint8_t len) {
     if (!cid || len > QL_CID_MAX_LEN) {
         return;
@@ -3722,6 +3766,32 @@ int ql_tls_get_peer_tp(ql_tls_t *tls, uint8_t *buf, size_t cap) {
     return tls->get_peer_tp(tls->tls_ctx, buf, cap);
 }
 
+int ql_tls_set_tp(ql_tls_t *tls, const uint8_t *buf, size_t len) {
+    return tls->set_tp(tls->tls_ctx, buf, len);
+}
+
+/*
+ * ql__install_local_tp — encode conn->local_tp and hand it to the TLS
+ * layer so it's actually sent to the peer as a QUIC TLS extension. This
+ * MUST happen before the handshake starts producing CRYPTO data (i.e.
+ * before the first ql_conn_tick after ql_tls_init), since OpenSSL/quictls
+ * bakes the transport parameters extension into the first flight.
+ *
+ * Found missing while wiring the stateless reset token into local_tp:
+ * ql_tls_t.set_tp (-> SSL_set_quic_transport_params) was fully
+ * implemented but nothing ever called it, so every connection this
+ * session has driven so far was negotiating with none of our declared
+ * transport parameters actually sent to the peer.
+ */
+static int ql__install_local_tp(ql_conn_t *conn) {
+    uint8_t buf[512];
+    int len = ql_tp_encode(&conn->local_tp, buf, sizeof(buf));
+    if (len < 0) {
+        return len;
+    }
+    return ql_tls_set_tp(&conn->tls, buf, (size_t)len);
+}
+
 bool ql_tls_handshake_done(const ql_tls_t *tls) {
     return tls->is_done(tls->tls_ctx);
 }
@@ -3842,129 +3912,18 @@ static int ql__send_ack(ql_conn_t *conn, ql_pn_space_t space, ql_enc_level_t lev
 static void ql__set_loss_detection_timer(ql_conn_t *conn, uint64_t now_ms);
 static void ql__detect_and_declare_losses(ql_conn_t *conn, ql_pn_space_t space, uint64_t now_ms);
 static void ql__on_pto_timeout(ql_conn_t *conn, uint64_t now_ms);
+static int ql__send_level_pkt_to(ql_conn_t *conn, ql_enc_level_t level, const uint8_t *payload,
+                                 size_t payload_len, bool ack_eliciting, uint32_t frame_flags,
+                                 uint64_t now_ms, const struct sockaddr_storage *dest,
+                                 socklen_t dest_len, int *out_idx);
+static int ql__send_level_pkt(ql_conn_t *conn, ql_enc_level_t level, const uint8_t *payload,
+                              size_t payload_len, bool ack_eliciting, uint32_t frame_flags,
+                              uint64_t now_ms, int *out_idx);
 static int ql__key_update_prepare(ql_conn_t *conn);
 static void ql__key_update_promote(ql_conn_t *conn, uint64_t now_ms);
 static void ql__on_possible_migration(ql_conn_t *conn, const struct sockaddr_storage *src_addr,
                                       socklen_t src_addrlen, uint64_t now_ms);
 static void ql__cid_issue_new(ql_conn_t *conn, uint64_t now_ms);
-
-/*
- * ql__send_level_pkt — encrypt `payload` as one packet at `level`, enqueue
- * the resulting datagram, and record sent-packet bookkeeping that later
- * phases (retransmission, congestion control) will build on.
- */
-static int ql__send_level_pkt_to(ql_conn_t *conn, ql_enc_level_t level, const uint8_t *payload,
-                                 size_t payload_len, bool ack_eliciting, uint32_t frame_flags,
-                                 uint64_t now_ms, const struct sockaddr_storage *dest,
-                                 socklen_t dest_len, int *out_idx) {
-    ql_keys_t *wk = &conn->keys[level].write;
-    if (!wk->is_set) {
-        return QLITE_ERR_CRYPTO;
-    }
-    if (conn->send_queue.count >= QL_MAX_COALESCE_PKTS) {
-        return QLITE_ERR_BUF;
-    }
-
-    /* 3.6.2 — anti-amplification gate: a server that hasn't validated the
-     * client's address may not send more than 3x what it has received. */
-    if (conn->role == QL_ROLE_SERVER && !conn->addr_valid.validated) {
-        uint64_t budget = conn->addr_valid.bytes_received * QL_AMPLIFICATION_FACTOR;
-        if (conn->addr_valid.bytes_sent + payload_len + QL_AEAD_TAG_LEN + 64 > budget) {
-            return QLITE_ERR_WOULDBLOCK;
-        }
-    }
-
-    ql_pn_space_t space  = ql__level_to_pn_space(level);
-    ql_pkt_num_t pn      = conn->next_pn[space];
-
-    ql_pkt_hdr_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-
-    if (level == QL_ENC_LEVEL_APP) {
-        hdr.is_long          = false;
-        ql_short_hdr_t *sh   = &hdr.h.shdr;
-        sh->first_byte       = QL_SHORT_HDR_FIXED_BIT | (conn->spin_bit ? QL_SHORT_HDR_SPIN_BIT : 0) |
-                          (conn->key_update.current_phase ? QL_SHORT_HDR_KEY_PHASE : 0);
-        sh->dst_cid = conn->remote_cid;
-        sh->pkt_num = pn;
-    } else {
-        hdr.is_long        = true;
-        ql_long_hdr_t *lh  = &hdr.h.lhdr;
-        uint8_t type_bits;
-        switch (level) {
-            case QL_ENC_LEVEL_INITIAL:   lh->pkt_type = QL_PKT_INITIAL;   type_bits = 0; break;
-            case QL_ENC_LEVEL_EARLY_DATA: lh->pkt_type = QL_PKT_0RTT;      type_bits = 1; break;
-            case QL_ENC_LEVEL_HANDSHAKE: lh->pkt_type = QL_PKT_HANDSHAKE; type_bits = 2; break;
-            default: return QLITE_ERR_ARGS;
-        }
-        lh->first_byte = (uint8_t)(QL_LONG_HDR_FORM | QL_LONG_HDR_FIXED_BIT |
-                                   (type_bits << QL_LONG_HDR_TYPE_SHIFT));
-        lh->version = QL_VERSION_1;
-        lh->dst_cid = conn->remote_cid;
-        lh->src_cid = conn->local_cid;
-        lh->pkt_num = pn;
-        if (lh->pkt_type == QL_PKT_INITIAL && conn->token.len > 0) {
-            memcpy(lh->token, conn->token.data, conn->token.len);
-            lh->token_len = conn->token.len;
-        }
-    }
-
-    uint8_t out_buf[QL_PATH_MTU_ETHERNET + 64];
-    int n = ql_pkt_encode(&hdr, wk, payload, payload_len, out_buf, sizeof(out_buf));
-    if (n < 0) {
-        return n;
-    }
-
-    ql_datagram_t *dg = &conn->send_queue.datagrams[conn->send_queue.tail];
-    memcpy(dg->data, out_buf, (size_t)n);
-    dg->len      = (size_t)n;
-    dg->dest     = *dest;
-    dg->dest_len = dest_len;
-    conn->send_queue.tail = (conn->send_queue.tail + 1) % QL_MAX_COALESCE_PKTS;
-    conn->send_queue.count++;
-
-    conn->next_pn[space] = pn + 1;
-
-    int idx                              = conn->sent_pkt_tail;
-    conn->sent_pkts[idx].pkt_num         = pn;
-    conn->sent_pkts[idx].pn_space        = space;
-    conn->sent_pkts[idx].sent_at_ms      = now_ms;
-    conn->sent_pkts[idx].in_flight_bytes = (size_t)n;
-    conn->sent_pkts[idx].ack_eliciting   = ack_eliciting;
-    conn->sent_pkts[idx].in_flight       = ack_eliciting;
-    conn->sent_pkts[idx].is_lost         = false;
-    conn->sent_pkts[idx].is_acked        = false;
-    conn->sent_pkts[idx].frame_flags     = frame_flags;
-    conn->sent_pkt_tail                  = (conn->sent_pkt_tail + 1) % QL_SENT_PKT_MAX;
-    if (conn->sent_pkt_count < QL_SENT_PKT_MAX) {
-        conn->sent_pkt_count++;
-    }else{
-        /* Ring is full: the slot we just overwrote (== old head) is now
-         * the newest entry, so the true oldest entry moved forward one. */
-        conn->sent_pkt_head = (conn->sent_pkt_head + 1) % QL_SENT_PKT_MAX;
-    }
-
-    conn->bytes_sent_total += (uint64_t)n;
-    conn->pkts_sent++;
-    conn->addr_valid.bytes_sent += (uint64_t)n;
-
-    if (out_idx) {
-        *out_idx = idx;
-    }
-
-    return n;
-}
-
-/* Thin wrapper: sends to the currently active path, as almost every caller
- * wants. ql__send_level_pkt_to exists for path validation / migration
- * probes (chunk 6.2/6.3), which must target a not-yet-active address. */
-static int ql__send_level_pkt(ql_conn_t *conn, ql_enc_level_t level, const uint8_t *payload,
-                              size_t payload_len, bool ack_eliciting, uint32_t frame_flags,
-                              uint64_t now_ms, int *out_idx) {
-    return ql__send_level_pkt_to(conn, level, payload, payload_len, ack_eliciting, frame_flags,
-                                 now_ms, &conn->active_path.peer_addr, conn->active_path.peer_addrlen,
-                                 out_idx);
-}
 
 static int ql__process_frames(ql_conn_t *conn, ql_enc_level_t level, const uint8_t *payload,
                               size_t payload_len, uint64_t now_ms,
@@ -4013,13 +3972,30 @@ static int ql__process_frames(ql_conn_t *conn, ql_enc_level_t level, const uint8
                 break;
 
             case QL_FRAME_CONNECTION_CLOSE:
-            case QL_FRAME_CONNECTION_CLOSE_APP:
-                /* Full draining-state handling (echo suppression, drain
-                 * timer, on_close callback) is chunk 7.2; record enough
-                 * here that the tick loop stops sending. */
+            case QL_FRAME_CONNECTION_CLOSE_APP: {
+                /* Not ack-eliciting (§13.2.1) — ack_eliciting stays false. */
+                bool already_closing = conn->closing;
                 conn->closing = true;
                 conn->state   = QL_CONN_DRAINING;
+
+                if (!already_closing) {
+                    const ql_frame_conn_close_t *cc = &frame.u.conn_close;
+                    conn->close_app_error = cc->is_app ? cc->app_error_code : 0;
+                    conn->close_error     = cc->is_app ? QL_ERR_NO_ERROR : cc->error_code;
+
+                    /* §10.2.2 — drain for (at least) 3x the current PTO
+                     * estimate before the app frees this connection. */
+                    uint64_t rtt_us = conn->cc.rtt_sample_taken ? conn->cc.smoothed_rtt_us
+                                                                : QL_INITIAL_RTT_US;
+                    conn->timer_drain.deadline_ms = now_ms + 3 * (rtt_us / 1000 + 1);
+                    conn->timer_drain.armed       = true;
+
+                    if (conn->cfg.on_close) {
+                        conn->cfg.on_close(conn, conn->close_error, conn->cfg.user);
+                    }
+                }
                 break;
+            }
 
             case QL_FRAME_STREAM:
             case QL_FRAME_STREAM_FIN:
@@ -4240,6 +4216,260 @@ static int ql__process_frames(ql_conn_t *conn, ql_enc_level_t level, const uint8
     return (int)pos;
 }
 
+/*
+ * ql__send_level_pkt — encrypt `payload` as one packet at `level`, enqueue
+ * the resulting datagram, and record sent-packet bookkeeping that later
+ * phases (retransmission, congestion control) will build on.
+ */
+static int ql__send_level_pkt_to(ql_conn_t *conn, ql_enc_level_t level, const uint8_t *payload,
+                                 size_t payload_len, bool ack_eliciting, uint32_t frame_flags,
+                                 uint64_t now_ms, const struct sockaddr_storage *dest,
+                                 socklen_t dest_len, int *out_idx) {
+    ql_keys_t *wk = &conn->keys[level].write;
+    if (!wk->is_set) {
+        return QLITE_ERR_CRYPTO;
+    }
+    if (conn->send_queue.count >= QL_MAX_COALESCE_PKTS) {
+        return QLITE_ERR_BUF;
+    }
+
+    /* 3.6.2 — anti-amplification gate: a server that hasn't validated the
+     * client's address may not send more than 3x what it has received. */
+    if (conn->role == QL_ROLE_SERVER && !conn->addr_valid.validated) {
+        uint64_t budget = conn->addr_valid.bytes_received * QL_AMPLIFICATION_FACTOR;
+        if (conn->addr_valid.bytes_sent + payload_len + QL_AEAD_TAG_LEN + 64 > budget) {
+            return QLITE_ERR_WOULDBLOCK;
+        }
+    }
+
+    ql_pn_space_t space  = ql__level_to_pn_space(level);
+    ql_pkt_num_t pn      = conn->next_pn[space];
+
+    ql_pkt_hdr_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+
+    if (level == QL_ENC_LEVEL_APP) {
+        hdr.is_long          = false;
+        ql_short_hdr_t *sh   = &hdr.h.shdr;
+        sh->first_byte       = QL_SHORT_HDR_FIXED_BIT | (conn->spin_bit ? QL_SHORT_HDR_SPIN_BIT : 0) |
+                          (conn->key_update.current_phase ? QL_SHORT_HDR_KEY_PHASE : 0);
+        sh->dst_cid = conn->remote_cid;
+        sh->pkt_num = pn;
+    } else {
+        hdr.is_long        = true;
+        ql_long_hdr_t *lh  = &hdr.h.lhdr;
+        uint8_t type_bits;
+        switch (level) {
+            case QL_ENC_LEVEL_INITIAL:   lh->pkt_type = QL_PKT_INITIAL;   type_bits = 0; break;
+            case QL_ENC_LEVEL_EARLY_DATA: lh->pkt_type = QL_PKT_0RTT;      type_bits = 1; break;
+            case QL_ENC_LEVEL_HANDSHAKE: lh->pkt_type = QL_PKT_HANDSHAKE; type_bits = 2; break;
+            default: return QLITE_ERR_ARGS;
+        }
+        lh->first_byte = (uint8_t)(QL_LONG_HDR_FORM | QL_LONG_HDR_FIXED_BIT |
+                                   (type_bits << QL_LONG_HDR_TYPE_SHIFT));
+        lh->version = QL_VERSION_1;
+        lh->dst_cid = conn->remote_cid;
+        lh->src_cid = conn->local_cid;
+        lh->pkt_num = pn;
+        if (lh->pkt_type == QL_PKT_INITIAL && conn->token.len > 0) {
+            memcpy(lh->token, conn->token.data, conn->token.len);
+            lh->token_len = conn->token.len;
+        }
+    }
+
+    uint8_t out_buf[QL_PATH_MTU_ETHERNET + 64];
+    int n = ql_pkt_encode(&hdr, wk, payload, payload_len, out_buf, sizeof(out_buf));
+    if (n < 0) {
+        return n;
+    }
+
+    ql_datagram_t *dg = &conn->send_queue.datagrams[conn->send_queue.tail];
+    memcpy(dg->data, out_buf, (size_t)n);
+    dg->len      = (size_t)n;
+    dg->dest     = *dest;
+    dg->dest_len = dest_len;
+    conn->send_queue.tail = (conn->send_queue.tail + 1) % QL_MAX_COALESCE_PKTS;
+    conn->send_queue.count++;
+
+    conn->next_pn[space] = pn + 1;
+
+    int idx                              = conn->sent_pkt_tail;
+    conn->sent_pkts[idx].pkt_num         = pn;
+    conn->sent_pkts[idx].pn_space        = space;
+    conn->sent_pkts[idx].sent_at_ms      = now_ms;
+    conn->sent_pkts[idx].in_flight_bytes = (size_t)n;
+    conn->sent_pkts[idx].ack_eliciting   = ack_eliciting;
+    conn->sent_pkts[idx].in_flight       = ack_eliciting;
+    conn->sent_pkts[idx].is_lost         = false;
+    conn->sent_pkts[idx].is_acked        = false;
+    conn->sent_pkts[idx].frame_flags     = frame_flags;
+    conn->sent_pkt_tail                  = (conn->sent_pkt_tail + 1) % QL_SENT_PKT_MAX;
+    if (conn->sent_pkt_count < QL_SENT_PKT_MAX) {
+        conn->sent_pkt_count++;
+    } else {
+        /* Ring is full: the slot we just overwrote (== old head) is now
+         * the newest entry, so the true oldest entry moved forward one. */
+        conn->sent_pkt_head = (conn->sent_pkt_head + 1) % QL_SENT_PKT_MAX;
+    }
+
+    conn->bytes_sent_total += (uint64_t)n;
+    conn->pkts_sent++;
+    conn->addr_valid.bytes_sent += (uint64_t)n;
+    conn->last_activity_ms = now_ms; /* 10.1 */
+
+    if (out_idx) {
+        *out_idx = idx;
+    }
+    return n;
+}
+
+/* Thin wrapper: sends to the currently active path, as almost every caller
+ * wants. ql__send_level_pkt_to exists for path validation / migration
+ * probes (chunk 6.2/6.3), which must target a not-yet-active address. */
+static int ql__send_level_pkt(ql_conn_t *conn, ql_enc_level_t level, const uint8_t *payload,
+                              size_t payload_len, bool ack_eliciting, uint32_t frame_flags,
+                              uint64_t now_ms, int *out_idx) {
+    return ql__send_level_pkt_to(conn, level, payload, payload_len, ack_eliciting, frame_flags,
+                                 now_ms, &conn->active_path.peer_addr, conn->active_path.peer_addrlen,
+                                 out_idx);
+}
+
+/*
+ * ql__conn_process_datagram — chunk 7.3.1/7.3.2's per-datagram body,
+ * factored out of ql_conn_tick so a server listener (chunk 7.1) can feed
+ * it datagrams it already read and demuxed from its own shared socket,
+ * without needing each connection to own a dedicated OS socket.
+ */
+static void ql__conn_process_datagram(ql_conn_t *conn, uint8_t *rx_buf, size_t rn,
+                                      const struct sockaddr_storage *rx_from, socklen_t rx_fromlen,
+                                      uint64_t now_ms) {
+    if (conn->state == QL_CONN_DRAINING) {
+        return; /* §10.2.2 — remain completely silent */
+    }
+    if (conn->state == QL_CONN_CLOSING) {
+        /* §10.2.1 — retransmit the CONNECTION_CLOSE datagram in response to
+         * any further packet from the peer. A stricter implementation
+         * would rate-limit this explicitly; here it's naturally bounded
+         * since it only fires once per received packet. */
+        if (conn->close_pkt_len > 0 && conn->fd >= 0) {
+            ql_udp_send(conn->fd, (const struct sockaddr *)rx_from, rx_fromlen, conn->close_pkt,
+                       conn->close_pkt_len);
+        }
+        return;
+    }
+
+    uint8_t rx_payload[QL_PATH_MTU_ETHERNET + 64];
+
+    conn->bytes_received_total += (uint64_t)rn;
+    conn->pkts_received++;
+    conn->addr_valid.bytes_received += (uint64_t)rn; /* 3.6.1 */
+
+    uint8_t first  = rx_buf[0];
+    bool is_long   = QL_PKT_IS_LONG(first);
+    ql_enc_level_t level;
+
+    if (is_long) {
+        if (rn < 5) {
+            return;
+        }
+        uint32_t ver = ((uint32_t)rx_buf[1] << 24) | ((uint32_t)rx_buf[2] << 16) |
+                       ((uint32_t)rx_buf[3] << 8) | (uint32_t)rx_buf[4];
+        if (ver == QL_VERSION_NEGOTIATION) {
+            /* Chunk 3.5.5 — parsed but not yet surfaced to the caller /
+             * used to abort the connection. */
+            ql_ver_neg_pkt_t vn;
+            ql_vn_decode(rx_buf, rn, &vn);
+            return;
+        }
+        uint8_t type_bits = (uint8_t)((first & QL_LONG_HDR_TYPE_MASK) >> QL_LONG_HDR_TYPE_SHIFT);
+        switch (type_bits) {
+            case 0: level = QL_ENC_LEVEL_INITIAL; break;
+            case 1: level = QL_ENC_LEVEL_EARLY_DATA; break;
+            case 2: level = QL_ENC_LEVEL_HANDSHAKE; break;
+            default:
+                /* Retry — chunks 2.4/3.5.1-3.5.3 not yet wired in. */
+                return;
+        }
+    } else {
+        level = QL_ENC_LEVEL_APP;
+    }
+
+    ql_keys_t *rk = &conn->keys[level].read;
+    if (!rk->is_set) {
+        return; /* can't decrypt this level (yet, or ever) */
+    }
+
+    ql_pkt_hdr_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    if (!is_long) {
+        /* ql_pkt_decode's short-header convention: caller supplies the
+         * expected DCID length before calling. */
+        hdr.h.shdr.dst_cid.len = conn->local_cid.len;
+    }
+
+    int dn = ql_pkt_decode(rx_buf, rn, rk, &hdr, rx_payload, sizeof(rx_payload));
+    if (dn < 0 && level == QL_ENC_LEVEL_APP && hdr.h.shdr.key_phase != conn->key_update.current_phase) {
+        /* RFC 9001 §6.3/6.4 — a key_phase mismatch survived header
+         * protection removal (which uses a phase-invariant key), so this
+         * may genuinely be a peer-initiated update rather than corruption.
+         * Prepare the other generation if we haven't already, promote to
+         * it, and retry once. */
+        if (ql__key_update_prepare(conn) == 0) {
+            ql__key_update_promote(conn, now_ms);
+            dn = ql_pkt_decode(rx_buf, rn, &conn->keys[level].read, &hdr, rx_payload,
+                              sizeof(rx_payload));
+        }
+    }
+    if (dn < 0) {
+        return; /* drop malformed/undecryptable datagram, §12.2 */
+    }
+    conn->last_activity_ms = now_ms; /* 10.1 */
+
+    ql_pn_space_t space = ql__level_to_pn_space(level);
+    ql_pkt_num_t pn     = is_long ? hdr.h.lhdr.pkt_num : hdr.h.shdr.pkt_num;
+    if (conn->largest_recvd[space] == QL_PKT_NUM_NONE || pn > conn->largest_recvd[space]) {
+        conn->largest_recvd[space] = pn;
+    }
+
+    if (level == QL_ENC_LEVEL_HANDSHAKE) {
+        conn->addr_valid.validated = true; /* 3.6.3 */
+    }
+
+    if (level == QL_ENC_LEVEL_APP && conn->cfg.enable_migration) {
+        bool same_addr = (rx_fromlen == conn->active_path.peer_addrlen) &&
+                         memcmp(rx_from, &conn->active_path.peer_addr, rx_fromlen) == 0;
+        if (!same_addr) {
+            /* AEAD auth already succeeded above, so this is either a
+             * genuine migration or an attacker who already holds our
+             * session keys (i.e. not a threat this check can add anything
+             * against) — safe to start validating it. */
+            ql__on_possible_migration(conn, rx_from, rx_fromlen, now_ms);
+        }
+    }
+
+    if (is_long && level == QL_ENC_LEVEL_INITIAL && hdr.h.lhdr.src_cid.len > 0) {
+        /* Learn the peer's chosen SCID (§7.2) from its Initial packets so
+         * our next packet addresses it correctly — applies to a server
+         * seeing the client's Initial just as much as the reverse.
+         * Unconditional (not "first touch only"): a client's remote_cid
+         * starts non-zero (its own made-up initial DCID), so gating this
+         * on remote_cid.len == 0 would mean the client's remote_cid never
+         * actually updates to the server's real SCID. Since a peer's SCID
+         * doesn't change across its Initial flight in practice, updating
+         * on every such packet is harmless for the server case too.
+         */
+        conn->remote_cid = hdr.h.lhdr.src_cid;
+    }
+
+    bool ack_eliciting = false;
+    int prc = ql__process_frames(conn, level, hdr.payload, hdr.payload_len, now_ms, rx_from,
+                                 rx_fromlen, &ack_eliciting);
+    if (prc < 0) {
+        return; /* malformed frame payload; drop the datagram */
+    }
+    ql__ack_record_recv(conn, space, pn, ack_eliciting, now_ms);
+}
+
 /* -------------------------------------------------------------------------
  * ql_conn_tick — the glue loop (chunk 7.3). Each call:
  *   1. drains any inbound datagrams and dispatches their frames,
@@ -4247,18 +4477,50 @@ static int ql__process_frames(ql_conn_t *conn, ql_enc_level_t level, const uint8
  *   3. flushes any newly-staged CRYPTO bytes out as packets,
  *   4. advances connection state and fires callbacks,
  *   5. flushes the outbound datagram queue to the socket.
- * Loss detection, ACK emission, and stream scheduling are later phases
- * and are not yet driven from here.
  * ------------------------------------------------------------------------- */
 int ql_conn_tick(ql_conn_t *conn, uint64_t now_ms) {
     if (!conn) {
         return QLITE_ERR_ARGS;
     }
 
+    /* ---- 0. Idle timeout / drain timer (chunk 7.2, §10.1/10.2) ---- */
+    if (conn->state == QL_CONN_CLOSING || conn->state == QL_CONN_DRAINING) {
+        if (conn->timer_drain.armed && now_ms >= conn->timer_drain.deadline_ms) {
+            return QLITE_ERR_CLOSED; /* fully done — caller should ql_conn_free() now */
+        }
+    } else if (conn->state != QL_CONN_IDLE && conn->last_activity_ms != 0) {
+        uint64_t effective;
+        if (conn->cfg.idle_timeout_ms != 0) {
+            effective = conn->cfg.idle_timeout_ms;
+        } else {
+            uint64_t local_adv = conn->local_tp.max_idle_timeout_ms;
+            uint64_t peer_adv  = conn->remote_tp_rcvd ? conn->remote_tp.max_idle_timeout_ms : 0;
+            if (local_adv == 0) {
+                effective = peer_adv;
+            } else if (peer_adv == 0) {
+                effective = local_adv;
+            } else {
+                effective = (local_adv < peer_adv) ? local_adv : peer_adv;
+            }
+        }
+        if (effective != 0 && now_ms - conn->last_activity_ms >= effective) {
+            /* §10.1 — silent close: no CONNECTION_CLOSE is sent. */
+            conn->state       = QL_CONN_DRAINING;
+            conn->closing     = true;
+            conn->close_error = QL_ERR_NO_ERROR;
+            if (conn->cfg.on_close) {
+                conn->cfg.on_close(conn, QL_ERR_NO_ERROR, conn->cfg.user);
+            }
+            return QLITE_ERR_CLOSED;
+        }
+    }
+
     /* ---- 1. Inbound datagrams (7.3.1 / 7.3.2) ---- */
-    if (conn->fd >= 0) {
+    if (conn->fd >= 0 && conn->role == QL_ROLE_CLIENT) {
+        /* Server connections don't own a dedicated socket — the listener
+         * (chunk 7.1) reads its shared socket, demuxes by CID, and calls
+         * ql__conn_process_datagram() directly for the right connection. */
         uint8_t rx_buf[QL_PATH_MTU_ETHERNET + 64];
-        uint8_t rx_payload[QL_PATH_MTU_ETHERNET + 64];
 
         for (;;) {
             struct sockaddr_storage rx_from;
@@ -4275,109 +4537,7 @@ int ql_conn_tick(ql_conn_t *conn, uint64_t now_ms) {
                 continue;
             }
 
-            conn->bytes_received_total += (uint64_t)rn;
-            conn->pkts_received++;
-            conn->addr_valid.bytes_received += (uint64_t)rn; /* 3.6.1 */
-
-            uint8_t first  = rx_buf[0];
-            bool is_long   = QL_PKT_IS_LONG(first);
-            ql_enc_level_t level;
-
-            if (is_long) {
-                if (rn < 5) {
-                    continue;
-                }
-                uint32_t ver = ((uint32_t)rx_buf[1] << 24) | ((uint32_t)rx_buf[2] << 16) |
-                               ((uint32_t)rx_buf[3] << 8) | (uint32_t)rx_buf[4];
-                if (ver == QL_VERSION_NEGOTIATION) {
-                    /* Chunk 3.5.5 — parsed but not yet surfaced to the
-                     * caller / used to abort the connection. */
-                    ql_ver_neg_pkt_t vn;
-                    ql_vn_decode(rx_buf, (size_t)rn, &vn);
-                    continue;
-                }
-                uint8_t type_bits =
-                    (uint8_t)((first & QL_LONG_HDR_TYPE_MASK) >> QL_LONG_HDR_TYPE_SHIFT);
-                switch (type_bits) {
-                    case 0: level = QL_ENC_LEVEL_INITIAL; break;
-                    case 1: level = QL_ENC_LEVEL_EARLY_DATA; break;
-                    case 2: level = QL_ENC_LEVEL_HANDSHAKE; break;
-                    default:
-                        /* Retry — chunks 2.4/3.5.1-3.5.3 not yet wired
-                         * into the tick loop. */
-                        continue;
-                }
-            } else {
-                level = QL_ENC_LEVEL_APP;
-            }
-
-            ql_keys_t *rk = &conn->keys[level].read;
-            if (!rk->is_set) {
-                continue; /* can't decrypt this level (yet, or ever) */
-            }
-
-            ql_pkt_hdr_t hdr;
-            memset(&hdr, 0, sizeof(hdr));
-            if (!is_long) {
-                /* ql_pkt_decode's short-header convention: caller supplies
-                 * the expected DCID length before calling. */
-                hdr.h.shdr.dst_cid.len = conn->local_cid.len;
-            }
-
-            int dn = ql_pkt_decode(rx_buf, (size_t)rn, rk, &hdr, rx_payload, sizeof(rx_payload));
-            if (dn < 0 && level == QL_ENC_LEVEL_APP &&
-                hdr.h.shdr.key_phase != conn->key_update.current_phase) {
-                /* RFC 9001 §6.3/6.4 — a key_phase mismatch survived header
-                 * protection removal (which uses a phase-invariant key), so
-                 * this may genuinely be a peer-initiated update rather than
-                 * corruption. Prepare the other generation if we haven't
-                 * already, promote to it, and retry once. */
-                if (ql__key_update_prepare(conn) == 0) {
-                    ql__key_update_promote(conn, now_ms);
-                    dn = ql_pkt_decode(rx_buf, (size_t)rn, &conn->keys[level].read, &hdr, rx_payload,
-                                       sizeof(rx_payload));
-                }
-            }
-            if (dn < 0) {
-                continue; /* drop malformed/undecryptable datagram, §12.2 */
-            }
-
-            ql_pn_space_t space = ql__level_to_pn_space(level);
-            ql_pkt_num_t pn     = is_long ? hdr.h.lhdr.pkt_num : hdr.h.shdr.pkt_num;
-            if (conn->largest_recvd[space] == QL_PKT_NUM_NONE || pn > conn->largest_recvd[space]) {
-                conn->largest_recvd[space] = pn;
-            }
-
-            if (level == QL_ENC_LEVEL_HANDSHAKE) {
-                conn->addr_valid.validated = true; /* 3.6.3 */
-            }
-
-            if (level == QL_ENC_LEVEL_APP && conn->cfg.enable_migration) {
-                bool same_addr = (rx_fromlen == conn->active_path.peer_addrlen) &&
-                                 memcmp(&rx_from, &conn->active_path.peer_addr, rx_fromlen) == 0;
-                if (!same_addr) {
-                    /* AEAD auth already succeeded above, so this is either a
-                     * genuine migration or an attacker who already holds
-                     * our session keys (i.e. not a threat this check can
-                     * add anything against) — safe to start validating it. */
-                    ql__on_possible_migration(conn, &rx_from, rx_fromlen, now_ms);
-                }
-            }
-
-            if (is_long && level == QL_ENC_LEVEL_INITIAL && conn->role == QL_ROLE_CLIENT &&
-                hdr.h.lhdr.src_cid.len > 0) {
-                /* Learn the server's chosen SCID (§7.2) so our next packet
-                 * addresses it correctly. */
-                conn->remote_cid = hdr.h.lhdr.src_cid;
-            }
-
-            bool ack_eliciting = false;
-            int prc = ql__process_frames(conn, level, hdr.payload, hdr.payload_len, now_ms, &rx_from,
-                                         rx_fromlen, &ack_eliciting);
-            if (prc < 0) {
-                continue; /* malformed frame payload; drop the datagram */
-            }
-            ql__ack_record_recv(conn, space, pn, ack_eliciting, now_ms);
+            ql__conn_process_datagram(conn, rx_buf, (size_t)rn, &rx_from, rx_fromlen, now_ms);
         }
     }
 
@@ -4558,7 +4718,8 @@ int ql_conn_tick(ql_conn_t *conn, uint64_t now_ms) {
                     if (flen >= 0) {
                         int sent_idx = -1;
                         int ssn = ql__send_level_pkt(conn, QL_ENC_LEVEL_APP, frame_buf,
-                                                     (size_t)flen, true, QL_RETX_FLAG_STREAM, now_ms, &sent_idx);
+                                                     (size_t)flen, true, QL_RETX_FLAG_STREAM, now_ms,
+                                                     &sent_idx);
                         if (ssn >= 0) {
                             if (sent_idx >= 0) {
                                 conn->sent_pkts[sent_idx].stream_id     = s->id;
@@ -4600,7 +4761,8 @@ int ql_conn_tick(ql_conn_t *conn, uint64_t now_ms) {
                         uint8_t bb[32];
                         int blen = ql_frame_encode(&bf, bb, sizeof(bb));
                         if (blen >= 0 && ql__send_level_pkt(conn, QL_ENC_LEVEL_APP, bb, (size_t)blen,
-                                                            true, QL_RETX_FLAG_STREAM, now_ms, NULL) >= 0) {
+                                                            true, QL_RETX_FLAG_STREAM, now_ms,
+                                                            NULL) >= 0) {
                             s->fc.send_blocked = true;
                             s->fc.blocked_at   = s->fc.send_limit;
                         }
@@ -4613,7 +4775,8 @@ int ql_conn_tick(ql_conn_t *conn, uint64_t now_ms) {
                         uint8_t bb[16];
                         int blen = ql_frame_encode(&bf, bb, sizeof(bb));
                         if (blen >= 0 && ql__send_level_pkt(conn, QL_ENC_LEVEL_APP, bb, (size_t)blen,
-                                                            true, QL_RETX_FLAG_STREAM, now_ms, NULL) >= 0) {
+                                                            true, QL_RETX_FLAG_STREAM, now_ms,
+                                                            NULL) >= 0) {
                             conn->fc.send_blocked = true;
                             conn->fc.blocked_at   = conn->fc.send_limit;
                         }
@@ -4808,10 +4971,18 @@ int qlite_connect(ql_conn_t *conn, const char *peer_addr, uint16_t peer_port, vo
                     conn->remote_cid.len) != 0) {
         return QLITE_ERR_CRYPTO;
     }
+    conn->local_tp.initial_src_cid = conn->local_cid; /* RFC 9000 §7.3 — both endpoints MUST send this */
+    if (ql__install_local_tp(conn) != 0) {
+        return QLITE_ERR_CRYPTO;
+    }
 
     conn->state = QL_CONN_INITIAL;
     return QLITE_OK;
 }
+
+/* =========================================================================
+ *     PHASE 4 — STREAMS & FLOW CONTROL  RFC 9000 §2-4
+ * ========================================================================= */
 
 /*
  * ql_new / ql_del — the project's single allocation choke point (chunk
@@ -4822,9 +4993,9 @@ static void *ql_new(size_t size) {
     return calloc(1, size);
 }
 
-// static void ql_del(void *ptr) {
-//     free(ptr);
-// }
+static void ql_del(void *ptr) {
+    free(ptr);
+}
 
 static bool ql__stream_type_is_bidi(ql_stream_type_t type) {
     return type == QL_STREAM_TYPE_CLIENT_BIDI || type == QL_STREAM_TYPE_SERVER_BIDI;
@@ -5013,7 +5184,7 @@ int qlite_stream_close(ql_conn_t *conn, ql_stream_t *stream, ql_app_error_t erro
     if (sn < 0) {
         return sn;
     }
-    if(sent_idx >= 0){
+    if (sent_idx >= 0) {
         conn->sent_pkts[sent_idx].stream_id = stream->id;
     }
 
@@ -5064,7 +5235,6 @@ static void ql__stream_apply_reset(ql_stream_t *stream, ql_app_error_t error_cod
     stream->fc.final_size_known = true;
     stream->rx_tail = stream->rx_head; /* drop anything unread and not yet consumed */
 }
-
 
 /*
  * ql_stream_rx_push — chunk 4.3: reassemble inbound STREAM frame data.
@@ -5191,6 +5361,10 @@ int qlite_recv(ql_conn_t *conn, ql_stream_t *stream, uint8_t *out, size_t max_le
 
     return (int)n;
 }
+
+/* =========================================================================
+ *     PHASE 5 — LOSS DETECTION & CONGESTION CONTROL  RFC 9002
+ * ========================================================================= */
 
 /*
  * ql__ack_record_recv — chunk 5.1.1: fold a just-decoded packet number into
@@ -5629,10 +5803,11 @@ static void ql__on_pto_timeout(ql_conn_t *conn, uint64_t now_ms) {
     conn->cc.pto_count++;
 
     for (int i = 0; i < QL_PN_SPACE_COUNT; i++) {
-        bool has_in_flight = false;
+        ql_pn_space_t space = (ql_pn_space_t)i;
+        bool has_in_flight  = false;
         for (int j = 0; j < conn->sent_pkt_count; j++) {
             int idx = (conn->sent_pkt_head + j) % QL_SENT_PKT_MAX;
-            if (conn->sent_pkts[idx].pn_space == i && conn->sent_pkts[idx].in_flight) {
+            if (conn->sent_pkts[idx].pn_space == space && conn->sent_pkts[idx].in_flight) {
                 has_in_flight = true;
                 break;
             }
@@ -5641,9 +5816,9 @@ static void ql__on_pto_timeout(ql_conn_t *conn, uint64_t now_ms) {
             continue;
         }
 
-        ql_enc_level_t level = (i == QL_PN_SPACE_INITIAL)   ? QL_ENC_LEVEL_INITIAL
-                              : (i == QL_PN_SPACE_HANDSHAKE) ? QL_ENC_LEVEL_HANDSHAKE
-                                                              : QL_ENC_LEVEL_APP;
+        ql_enc_level_t level = (space == QL_PN_SPACE_INITIAL)   ? QL_ENC_LEVEL_INITIAL
+                              : (space == QL_PN_SPACE_HANDSHAKE) ? QL_ENC_LEVEL_HANDSHAKE
+                                                                  : QL_ENC_LEVEL_APP;
         if (!conn->keys[level].write.is_set) {
             continue;
         }
@@ -5658,6 +5833,10 @@ static void ql__on_pto_timeout(ql_conn_t *conn, uint64_t now_ms) {
         }
     }
 }
+
+/* =========================================================================
+ *     PHASE 6 — CONNECTION MIGRATION, KEY UPDATE, CID ROTATION  RFC 9000 §5.1,9
+ * ========================================================================= */
 
 /*
  * ql__cid_issue_new — chunk 6.1: top up how many local CIDs we've handed
@@ -5876,6 +6055,380 @@ int qlite_key_update(ql_conn_t *conn) {
     ql__key_update_promote(conn, ql_now_ms());
     conn->key_update.update_pending = true;
     return QLITE_OK;
+}
+
+/* =========================================================================
+ *     PHASE 7 — CONNECTION CLOSE, SERVER LISTENER, STATELESS RESET
+ *     RFC 9000 §5.2, §7.1-7.3, §8.1.2, §10, §10.3
+ * ========================================================================= */
+
+/*
+ * qlite_close — chunk 7.2: begin a graceful (or error) close. Sends one
+ * CONNECTION_CLOSE frame at the highest available encryption level, moves
+ * to QL_CONN_CLOSING, and buffers the encoded datagram so
+ * ql__conn_process_datagram can (rate-limit-bounded) re-send it if the
+ * peer keeps talking to us during the drain period.
+ */
+int qlite_close(ql_conn_t *conn, bool is_app, uint64_t error_code, const char *reason) {
+    if (!conn) {
+        return QLITE_ERR_ARGS;
+    }
+    if (conn->state == QL_CONN_CLOSING || conn->state == QL_CONN_DRAINING) {
+        return QLITE_OK; /* already closing */
+    }
+
+    size_t reason_len = reason ? strlen(reason) : 0;
+    if (reason_len > sizeof(conn->close_reason)) {
+        reason_len = sizeof(conn->close_reason);
+    }
+    if (reason_len > 0) {
+        memcpy(conn->close_reason, reason, reason_len);
+    }
+    conn->close_reason_len = reason_len;
+    conn->close_app_error  = is_app ? error_code : 0;
+    conn->close_error      = is_app ? QL_ERR_NO_ERROR : (ql_transport_error_t)error_code;
+
+    ql_frame_t f;
+    memset(&f, 0, sizeof(f));
+    f.type                       = is_app ? QL_FRAME_CONNECTION_CLOSE_APP : QL_FRAME_CONNECTION_CLOSE;
+    f.u.conn_close.is_app         = is_app;
+    f.u.conn_close.error_code     = conn->close_error;
+    f.u.conn_close.app_error_code = conn->close_app_error;
+    f.u.conn_close.reason_length  = reason_len;
+    f.u.conn_close.reason_phrase  = conn->close_reason;
+
+    uint8_t buf[512];
+    int flen = ql_frame_encode(&f, buf, sizeof(buf));
+    if (flen < 0) {
+        return flen;
+    }
+
+    if (conn->state == QL_CONN_IDLE) {
+        /* Never got anywhere — nothing to tell a peer. Just stop. */
+        conn->state   = QL_CONN_DRAINING;
+        conn->closing = true;
+        return QLITE_OK;
+    }
+
+    /* §12.5 / §10.2.3 — use the most-recent (highest) available level so
+     * the peer, wherever its own handshake progress is, has the best
+     * chance of being able to decrypt it. */
+    ql_enc_level_t level = QL_ENC_LEVEL_APP;
+    if (!conn->keys[level].write.is_set) {
+        level = QL_ENC_LEVEL_HANDSHAKE;
+    }
+    if (!conn->keys[level].write.is_set) {
+        level = QL_ENC_LEVEL_INITIAL;
+    }
+    if (!conn->keys[level].write.is_set) {
+        conn->state   = QL_CONN_DRAINING; /* nothing we can send; just stop */
+        conn->closing = true;
+        return QLITE_OK;
+    }
+
+    int sn = ql__send_level_pkt(conn, level, buf, (size_t)flen, false, 0, ql_now_ms(), NULL);
+    if (sn < 0) {
+        return sn;
+    }
+
+    /* The datagram ql__send_level_pkt just built is still sitting in the
+     * send queue (flushed only at the next ql_conn_tick), so we can read
+     * it straight back out to stash for §10.2.1 retransmission. */
+    int qidx = (conn->send_queue.tail - 1 + QL_MAX_COALESCE_PKTS) % QL_MAX_COALESCE_PKTS;
+    ql_datagram_t *dg = &conn->send_queue.datagrams[qidx];
+    size_t copy_len   = (dg->len < sizeof(conn->close_pkt)) ? dg->len : sizeof(conn->close_pkt);
+    memcpy(conn->close_pkt, dg->data, copy_len);
+    conn->close_pkt_len = copy_len;
+
+    uint64_t rtt_us = conn->cc.rtt_sample_taken ? conn->cc.smoothed_rtt_us : QL_INITIAL_RTT_US;
+    conn->timer_drain.deadline_ms = ql_now_ms() + 3 * (rtt_us / 1000 + 1);
+    conn->timer_drain.armed       = true;
+
+    conn->state   = QL_CONN_CLOSING;
+    conn->closing = true;
+    return QLITE_OK;
+}
+
+/*
+ * ql_conn_free — chunk 7.2.6: release everything ql_conn_init /
+ * qlite_stream_open allocated. Does not free `conn` itself — callers that
+ * heap-allocated it (e.g. the listener, via ql_new) are responsible for
+ * that, mirroring how ql_conn_init doesn't allocate the struct either.
+ */
+void ql_conn_free(ql_conn_t *conn) {
+    if (!conn) {
+        return;
+    }
+    ql_stream_t *s = conn->stream_list;
+    while (s) {
+        ql_stream_t *next = s->next;
+        ql_del(s);
+        s = next;
+    }
+    conn->stream_list = NULL;
+
+    if (conn->fd >= 0 && conn->role == QL_ROLE_CLIENT) {
+        /* Server-side conn->fd aliases the listener's shared socket —
+         * only a client-owned dedicated socket should be closed here. */
+        close(conn->fd);
+    }
+    conn->fd = -1;
+
+    ql_tls_free(&conn->tls);
+}
+
+/*
+ * ql__derive_reset_token — RFC 9000 §10.3: a stateless reset token MUST be
+ * hard to guess but reproducible from the CID alone (no per-connection
+ * state needed), so a token can be issued even after this process has
+ * forgotten the connection existed. HKDF-SHA256 over the listener's
+ * secret, keyed by the CID, satisfies both properties.
+ */
+static void ql__derive_reset_token(const uint8_t *secret, size_t secret_len, const ql_cid_t *cid,
+                                   ql_reset_token_t *out) {
+    memset(out, 0, sizeof(*out));
+    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_name(NULL, "HKDF", NULL);
+    if (!pctx) {
+        return;
+    }
+    bool ok = EVP_PKEY_derive_init(pctx) > 0 &&
+              EVP_PKEY_CTX_hkdf_mode(pctx, EVP_PKEY_HKDEF_MODE_EXTRACT_AND_EXPAND) > 0 &&
+              EVP_PKEY_CTX_set_hkdf_md(pctx, EVP_sha256()) > 0 &&
+              EVP_PKEY_CTX_set1_hkdf_salt(pctx, (const uint8_t *)"", 0) > 0 &&
+              EVP_PKEY_CTX_set1_hkdf_key(pctx, secret, (int)secret_len) > 0 &&
+              EVP_PKEY_CTX_add1_hkdf_info(pctx, cid->data, cid->len) > 0;
+    if (ok) {
+        size_t outl = sizeof(out->data);
+        ok = EVP_PKEY_derive(pctx, out->data, &outl) > 0;
+    }
+    EVP_PKEY_CTX_free(pctx);
+    if (!ok) {
+        memset(out, 0, sizeof(*out));
+    }
+}
+
+/*
+ * qlite_listen — chunk 7.1: bind the shared server socket and stash the
+ * per-connection config template / TLS context every accepted connection
+ * will be built from.
+ */
+int qlite_listen(ql_listener_t *l, const char *bind_addr, uint16_t port, const ql_config_t *cfg,
+                 void *ssl_ctx) {
+    if (!l || !cfg || !ssl_ctx) {
+        return QLITE_ERR_ARGS;
+    }
+    memset(l, 0, sizeof(*l));
+
+    int fd = ql_udp_socket(bind_addr, port);
+    if (fd < 0) {
+        return fd;
+    }
+    l->fd           = fd;
+    l->cfg_template = *cfg;
+    l->ssl_ctx      = ssl_ctx;
+
+    if (ql__fill_random(l->reset_secret, sizeof(l->reset_secret)) != QLITE_OK) {
+        close(fd);
+        l->fd = -1;
+        return QLITE_ERR_INTERNAL;
+    }
+    return QLITE_OK;
+}
+
+static ql_conn_t *ql__listener_find_conn(ql_listener_t *l, const ql_cid_t *dcid) {
+    for (int i = 0; i < l->conn_count; i++) {
+        ql_conn_t *c = l->conns[i];
+        if (!c) {
+            continue;
+        }
+        for (int j = 0; j < c->local_cid_count; j++) {
+            if (!c->local_cids[j].is_retired && ql_cid_cmp(&c->local_cids[j].cid, dcid) == 0) {
+                return c;
+            }
+        }
+    }
+    return NULL;
+}
+
+/*
+ * qlite_listener_tick — chunk 7.1/7.3: drains the shared socket, demuxes
+ * each datagram to an existing connection by DCID, creates a new
+ * connection for an unrecognized Initial packet, and sends a stateless
+ * reset for an unrecognized short-header packet (§10.3 — the only safe
+ * response, since we have no CID or keys to address it properly).
+ *
+ * NOTE: Retry-based address validation (§8.1.2) is not implemented here —
+ * connections are accepted directly from the first Initial regardless of
+ * cfg->require_address_validation. Flagged clearly as a known gap.
+ */
+int qlite_listener_tick(ql_listener_t *l, uint64_t now_ms) {
+    if (!l) {
+        return QLITE_ERR_ARGS;
+    }
+
+    uint8_t rx_buf[QL_PATH_MTU_ETHERNET + 64];
+    for (;;) {
+        struct sockaddr_storage rx_from;
+        socklen_t rx_fromlen = sizeof(rx_from);
+        int rn = ql_udp_recv(l->fd, rx_buf, sizeof(rx_buf), &rx_from, &rx_fromlen);
+        if (rn == QLITE_ERR_WOULDBLOCK) {
+            break;
+        }
+        if (rn < 0) {
+            return rn;
+        }
+        if (rn < 2) {
+            continue;
+        }
+
+        uint8_t first = rx_buf[0];
+        bool is_long  = QL_PKT_IS_LONG(first);
+        ql_cid_t dcid;
+        memset(&dcid, 0, sizeof(dcid));
+
+        if (is_long) {
+            if (rn < 6) {
+                continue;
+            }
+            uint8_t dcid_len = rx_buf[5];
+            if (dcid_len > QL_CID_MAX_LEN || (size_t)(6 + dcid_len) > (size_t)rn) {
+                continue;
+            }
+            dcid.len = dcid_len;
+            memcpy(dcid.data, rx_buf + 6, dcid_len);
+        } else {
+            /* Short header doesn't self-describe DCID length; try every
+             * length any connection on this listener is actually using. */
+            for (uint8_t try_len = 0; try_len <= QL_CID_MAX_LEN && dcid.len == 0; try_len++) {
+                if ((size_t)(1 + try_len) > (size_t)rn) {
+                    break;
+                }
+                ql_cid_t candidate;
+                candidate.len = try_len;
+                memcpy(candidate.data, rx_buf + 1, try_len);
+                if (ql__listener_find_conn(l, &candidate)) {
+                    dcid = candidate;
+                }
+            }
+        }
+
+        ql_conn_t *conn = (dcid.len > 0 || !is_long) ? ql__listener_find_conn(l, &dcid) : NULL;
+
+        if (!conn) {
+            if (!is_long) {
+                /* §10.3 — unrecognized short-header packet: the only safe
+                 * reply is a stateless reset, shaped to look like a short
+                 * header packet so it isn't trivially distinguishable. */
+                if (rn >= QL_RESET_TOKEN_LEN + 5) {
+                    uint8_t reset_pkt[64];
+                    size_t reset_len = (size_t)rn > sizeof(reset_pkt) ? sizeof(reset_pkt) : (size_t)rn;
+                    if (reset_len < QL_RESET_TOKEN_LEN + 5) {
+                        reset_len = QL_RESET_TOKEN_LEN + 5;
+                    }
+                    if (ql__fill_random(reset_pkt, reset_len) == QLITE_OK) {
+                        reset_pkt[0] = (uint8_t)((reset_pkt[0] & 0x3F) | QL_SHORT_HDR_FIXED_BIT);
+                        ql_reset_token_t token;
+                        ql__derive_reset_token(l->reset_secret, sizeof(l->reset_secret), &dcid,
+                                               &token);
+                        memcpy(reset_pkt + reset_len - QL_RESET_TOKEN_LEN, token.data,
+                              QL_RESET_TOKEN_LEN);
+                        ql_udp_send(l->fd, (struct sockaddr *)&rx_from, rx_fromlen, reset_pkt,
+                                   reset_len);
+                    }
+                }
+                continue;
+            }
+
+            uint8_t type_bits = (uint8_t)((first & QL_LONG_HDR_TYPE_MASK) >> QL_LONG_HDR_TYPE_SHIFT);
+            if (type_bits != 0 /* not Initial */ || l->conn_count >= QL_LISTENER_MAX_CONNS) {
+                continue; /* can't start a connection from this datagram */
+            }
+
+            ql_conn_t *nc = (ql_conn_t *)ql_new(sizeof(ql_conn_t));
+            if (!nc) {
+                continue;
+            }
+            if (ql_conn_init(nc, QL_ROLE_SERVER, &l->cfg_template) != 0) {
+                ql_del(nc);
+                continue;
+            }
+            if (ql_tls_init(&nc->tls, l->ssl_ctx, QL_ROLE_SERVER, dcid.data, dcid.len) != 0) {
+                ql_del(nc);
+                continue;
+            }
+            nc->fd                          = l->fd; /* shared: sends only, never recv's directly */
+            nc->active_path.peer_addr       = rx_from;
+            nc->active_path.peer_addrlen    = rx_fromlen;
+            nc->active_path.mtu             = QL_PATH_MTU_DEFAULT;
+            nc->active_path.state           = QL_PATH_VALIDATED;
+            nc->state                       = QL_CONN_INITIAL;
+            ql__derive_reset_token(l->reset_secret, sizeof(l->reset_secret), &nc->local_cid,
+                                   &nc->local_reset_token);
+            nc->local_tp.stateless_reset_token     = nc->local_reset_token;
+            nc->local_tp.has_stateless_reset_token = true;
+            nc->local_tp.initial_src_cid           = nc->local_cid; /* §7.3 */
+            nc->local_tp.original_dst_cid          = dcid; /* §7.3 — client's original DCID */
+            if (ql__install_local_tp(nc) != 0) {
+                ql_tls_free(&nc->tls);
+                ql_del(nc);
+                continue;
+            }
+
+            l->conns[l->conn_count++] = nc;
+            conn                       = nc;
+        }
+
+        ql__conn_process_datagram(conn, rx_buf, (size_t)rn, &rx_from, rx_fromlen, now_ms);
+    }
+
+    /* Drive every known connection's own tick logic (TLS progress, CRYPTO/
+     * STREAM flush, ACKs, loss detection, ...) and move newly-confirmed
+     * ones into the accept queue. */
+    for (int i = 0; i < l->conn_count; i++) {
+        ql_conn_t *c = l->conns[i];
+        if (!c) {
+            continue;
+        }
+        int rc = ql_conn_tick(c, now_ms);
+
+        if (c->state == QL_CONN_CONNECTED && !c->user /* not yet handed out */ &&
+            l->accept_count < QL_LISTENER_ACCEPT_QUEUE) {
+            /* Use conn->user as a lightweight "already queued/accepted"
+             * marker so the same connection isn't enqueued twice; the app
+             * is free to overwrite it with its own pointer after accept. */
+            c->user                              = (void *)(uintptr_t)1;
+            l->accept_queue[l->accept_tail]      = c;
+            l->accept_tail                       = (l->accept_tail + 1) % QL_LISTENER_ACCEPT_QUEUE;
+            l->accept_count++;
+        }
+
+        if (rc == QLITE_ERR_CLOSED) {
+            /* Fully drained — reclaim it. */
+            ql_conn_free(c);
+            ql_del(c);
+            l->conns[i] = NULL;
+        }
+    }
+
+    return QLITE_OK;
+}
+
+/*
+ * qlite_accept — pop a connection whose handshake has confirmed. Ownership
+ * passes to the caller; the listener keeps ticking it (for socket I/O and
+ * protocol maintenance) via qlite_listener_tick as long as it's still in
+ * l->conns, but application-level use (streams, qlite_close, ...) is now
+ * the caller's responsibility.
+ */
+ql_conn_t *qlite_accept(ql_listener_t *l) {
+    if (!l || l->accept_count == 0) {
+        return NULL;
+    }
+    ql_conn_t *c = l->accept_queue[l->accept_head];
+    l->accept_head = (l->accept_head + 1) % QL_LISTENER_ACCEPT_QUEUE;
+    l->accept_count--;
+    c->user = NULL; /* clear the "queued" marker; app may set its own now */
+    return c;
 }
 
 #if defined(__cplusplus)
