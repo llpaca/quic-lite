@@ -7,6 +7,11 @@
 #include "crypto.test.h"
 #include "cid.test.h"
 #include "tls.test.h"
+#include "harness.test.h"
+#include "stream.test.h"
+#include "loss.test.h"
+#include "migration.test.h"
+#include "close.test.h"
 
 int ql_tests_run = 0;
 
@@ -132,6 +137,72 @@ int main(void) {
     RUN_TEST(test_tls_init_null_args_rejected);
     RUN_TEST(test_tls_free_is_safe_on_null_and_zeroed);
     RUN_TEST(test_tls_real_handshake_end_to_end_via_quictls);
+
+    /* harness self-check — chunk 3-7 integration bootstrap */
+    RUN_TEST(test_harness_pair_reaches_connected_state);
+
+    /* streams & flow control — chunk 4.x */
+    RUN_TEST(test_stream_open_assigns_correct_id_and_type);
+    RUN_TEST(test_stream_open_increments_sequentially_by_four);
+    RUN_TEST(test_stream_open_fresh_stream_starts_ready);
+    RUN_TEST(test_stream_find_locates_open_stream);
+    RUN_TEST(test_stream_open_respects_peer_max_streams_limit);
+    RUN_TEST(test_stream_send_recv_roundtrip_small);
+    RUN_TEST(test_stream_send_recv_roundtrip_multi_packet);
+    RUN_TEST(test_stream_fin_delivers_eof);
+    RUN_TEST(test_stream_reset_delivers_to_peer);
+    RUN_TEST(test_stream_peer_initiated_stream_is_auto_created);
+    RUN_TEST(test_stream_flow_control_caps_delivery_at_recv_limit);
+    RUN_TEST(test_stream_flow_control_window_grows_as_consumed);
+    RUN_TEST(test_conn_level_flow_control_caps_across_streams);
+    RUN_TEST(test_stream_rx_push_out_of_order_reassembles);
+    RUN_TEST(test_stream_rx_push_duplicate_bytes_are_idempotent);
+    RUN_TEST(test_stream_rx_push_final_size_mismatch_rejected);
+    RUN_TEST(test_stream_rx_push_respects_flow_control_limit);
+
+    /* loss detection & congestion control — chunk 5.x */
+    RUN_TEST(test_ack_record_first_packet_starts_one_range);
+    RUN_TEST(test_ack_record_consecutive_packets_extend_one_range);
+    RUN_TEST(test_ack_record_gap_creates_second_range);
+    RUN_TEST(test_ack_record_gap_fill_merges_ranges);
+    RUN_TEST(test_ack_record_duplicate_packet_is_noop);
+    RUN_TEST(test_ack_record_non_ack_eliciting_does_not_schedule_ack);
+    RUN_TEST(test_send_ack_encodes_largest_and_first_range);
+    RUN_TEST(test_send_ack_with_multiple_ranges_roundtrips_through_wire_codec);
+    RUN_TEST(test_rtt_sample_first_sample_sets_smoothed_rtt);
+    RUN_TEST(test_rtt_sample_subsequent_sample_updates_smoothed_rtt);
+    RUN_TEST(test_rtt_sample_ack_delay_reduces_adjusted_rtt);
+    RUN_TEST(test_congestion_control_initial_window_matches_rfc9002);
+    RUN_TEST(test_sent_packets_are_marked_acked_after_real_roundtrip);
+    RUN_TEST(test_lost_stream_data_is_retransmitted_and_still_arrives);
+    RUN_TEST(test_pto_arms_when_ack_eliciting_packet_outstanding);
+
+    /* migration, key update, CID rotation — chunk 6.x */
+    RUN_TEST(test_cid_issuance_grows_peer_cid_table);
+    RUN_TEST(test_cid_issuance_respects_active_cid_limit);
+    RUN_TEST(test_new_connection_id_frame_roundtrips_through_wire_codec);
+    RUN_TEST(test_retire_connection_id_marks_local_cid_retired);
+    RUN_TEST(test_path_challenge_frame_roundtrips_through_wire_codec);
+    RUN_TEST(test_path_challenge_is_echoed_as_path_response);
+    RUN_TEST(test_migration_from_new_address_is_validated_and_promoted);
+    RUN_TEST(test_key_update_changes_app_keys_but_not_hp_key);
+    RUN_TEST(test_key_update_data_still_decrypts_correctly_on_peer);
+    RUN_TEST(test_key_update_before_first_ack_is_rejected);
+    RUN_TEST(test_key_update_allowed_again_after_ack);
+
+    /* close, listener/accept, stateless reset — chunk 7.x */
+    RUN_TEST(test_close_transitions_self_to_closing);
+    RUN_TEST(test_close_delivers_connection_close_to_peer);
+    RUN_TEST(test_close_app_error_delivers_app_code_to_peer);
+    RUN_TEST(test_close_fires_on_close_callback_on_peer);
+    RUN_TEST(test_closing_state_retransmits_close_pkt_via_socket);
+    RUN_TEST(test_draining_state_sends_nothing);
+    RUN_TEST(test_drain_timer_expiry_signals_conn_tick_done);
+    RUN_TEST(test_idle_timeout_closes_silently);
+    RUN_TEST(test_double_close_is_a_noop);
+    RUN_TEST(test_conn_free_releases_stream_list);
+    RUN_TEST(test_listener_accepts_real_client_connection);
+    RUN_TEST(test_listener_sends_stateless_reset_for_unknown_short_header);
 
     ql_test_summary();
     return 0;
