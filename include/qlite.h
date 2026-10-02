@@ -26,6 +26,7 @@ extern "C" {
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <time.h>
@@ -3912,6 +3913,13 @@ static int ql__send_ack(ql_conn_t *conn, ql_pn_space_t space, ql_enc_level_t lev
 static void ql__set_loss_detection_timer(ql_conn_t *conn, uint64_t now_ms);
 static void ql__detect_and_declare_losses(ql_conn_t *conn, ql_pn_space_t space, uint64_t now_ms);
 static void ql__on_pto_timeout(ql_conn_t *conn, uint64_t now_ms);
+static int ql__send_level_pkt_to(ql_conn_t *conn, ql_enc_level_t level, const uint8_t *payload,
+                                 size_t payload_len, bool ack_eliciting, uint32_t frame_flags,
+                                 uint64_t now_ms, const struct sockaddr_storage *dest,
+                                 socklen_t dest_len, int *out_idx);
+static int ql__send_level_pkt(ql_conn_t *conn, ql_enc_level_t level, const uint8_t *payload,
+                              size_t payload_len, bool ack_eliciting, uint32_t frame_flags,
+                              uint64_t now_ms, int *out_idx);
 static int ql__key_update_prepare(ql_conn_t *conn);
 static void ql__key_update_promote(ql_conn_t *conn, uint64_t now_ms);
 static void ql__on_possible_migration(ql_conn_t *conn, const struct sockaddr_storage *src_addr,
@@ -4440,8 +4448,7 @@ static void ql__conn_process_datagram(ql_conn_t *conn, uint8_t *rx_buf, size_t r
         }
     }
 
-    if (is_long && level == QL_ENC_LEVEL_INITIAL && hdr.h.lhdr.src_cid.len > 0 &&
-        conn->remote_cid.len == 0) {
+    if (is_long && level == QL_ENC_LEVEL_INITIAL && hdr.h.lhdr.src_cid.len > 0) {
         /* Learn the peer's chosen SCID (§7.2) from its Initial packets so
          * our next packet addresses it correctly — applies to a server
          * seeing the client's Initial just as much as the reverse.
@@ -5797,10 +5804,11 @@ static void ql__on_pto_timeout(ql_conn_t *conn, uint64_t now_ms) {
     conn->cc.pto_count++;
 
     for (int i = 0; i < QL_PN_SPACE_COUNT; i++) {
+        ql_pn_space_t space = (ql_pn_space_t)i;
         bool has_in_flight  = false;
         for (int j = 0; j < conn->sent_pkt_count; j++) {
             int idx = (conn->sent_pkt_head + j) % QL_SENT_PKT_MAX;
-            if (conn->sent_pkts[idx].pn_space == i && conn->sent_pkts[idx].in_flight) {
+            if (conn->sent_pkts[idx].pn_space == space && conn->sent_pkts[idx].in_flight) {
                 has_in_flight = true;
                 break;
             }
@@ -5809,8 +5817,8 @@ static void ql__on_pto_timeout(ql_conn_t *conn, uint64_t now_ms) {
             continue;
         }
 
-        ql_enc_level_t level = (i == QL_PN_SPACE_INITIAL)   ? QL_ENC_LEVEL_INITIAL
-                              : (i == QL_PN_SPACE_HANDSHAKE) ? QL_ENC_LEVEL_HANDSHAKE
+        ql_enc_level_t level = (space == QL_PN_SPACE_INITIAL)   ? QL_ENC_LEVEL_INITIAL
+                              : (space == QL_PN_SPACE_HANDSHAKE) ? QL_ENC_LEVEL_HANDSHAKE
                                                                   : QL_ENC_LEVEL_APP;
         if (!conn->keys[level].write.is_set) {
             continue;
