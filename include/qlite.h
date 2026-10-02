@@ -3596,7 +3596,7 @@ static int impl_get_data(void *tls_ctx, ql_enc_level_t level, uint8_t *buf, size
     size_t avail = ob->len - ob->read_off;
     size_t n     = avail < cap ? avail : cap;
     if (n == 0) {
-        return 1;
+        return 0;
     }
 
     memcpy(buf, ob->buf + ob->read_off, n);
