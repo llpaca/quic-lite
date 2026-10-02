@@ -394,8 +394,8 @@ TEST(test_frame_ack_with_ranges_roundtrip) {
     enc.u.ack.range_count       = 1;
     enc.u.ack.first_ack_range   = 10;
     enc.u.ack.has_ecn           = false;
-    enc.u.ack.ranges[0].largest = 3; /* gap value on the wire */
-    enc.u.ack.ranges[0].count   = 5; /* range_len value: count-1 written */
+    enc.u.ack.ranges[0].largest = 85; /* gap value on the wire */
+    enc.u.ack.ranges[0].count   = 6; /* range_len value: count-1 written */
 
     int n = ql_frame_encode(&enc, buf, sizeof(buf));
     EXPECT_GT(n, 0);
@@ -406,8 +406,7 @@ TEST(test_frame_ack_with_ranges_roundtrip) {
     EXPECT_EQ(dec.u.ack.first_ack_range, (uint64_t)10);
     /* decoded range: largest = 100 - 10 - 3 - 2 = 85, count = 5+1 = 6 */
     EXPECT_EQ(dec.u.ack.ranges[0].largest, (ql_pkt_num_t)85);
-    EXPECT_EQ(dec.u.ack.ranges[0].count,
-              (uint64_t)5); // to be noted that this passes on 5(as we begin cnt with 0)
+    EXPECT_EQ(dec.u.ack.ranges[0].count, (uint64_t)6);
 }
 
 TEST(test_frame_decode_buf_too_small) {
