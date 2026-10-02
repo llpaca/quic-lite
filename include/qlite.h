@@ -1279,6 +1279,7 @@ struct ql_conn {
     ql_timer_t timer_drain;                  /* 10.2.2 */
     ql_timer_t timer_ack[QL_PN_SPACE_COUNT]; /* 13.2.1 — per space */
     uint64_t last_activity_ms; /* last time we sent or received anything (10.1) */
+    uint64_t last_tick_ms;     /* most recent now_ms seen by tick/process_datagram */
 
     /* ---- Close state 10.2 ---- */
     bool closing;
@@ -2493,14 +2494,40 @@ int ql_pkt_encode(const ql_pkt_hdr_t *hdr, const ql_keys_t *key, const uint8_t *
     /* header -> ql_aead_seal() -> ql_hp_protect() */
     size_t pos = 0;
 
+    ql_pkt_num_t pkt_num = hdr->is_long ? hdr->h.lhdr.pkt_num : hdr->h.shdr.pkt_num;
+
+    /* Encode the packet number up front: its length feeds the first byte,
+     * the Length field (long header) and the HP sample position. */
+    uint8_t pn_buf[QL_PKT_NUM_MAX_ENCODED_LEN];
+    int pn_len = ql_pkt_num_encode(pn_buf, pkt_num, QL_PKT_NUM_NONE /* simplified */);
+    if (pn_len < 0) {
+        return pn_len;
+    }
+
+    /* RFC 9001 5.4.2 - the HP sample starts 4 bytes after the start of the
+     * pkt-num field and is 16 bytes long, so pkt-num + ciphertext (payload +
+     * tag) must cover that. With a 16-byte tag, that means pn_len + payload
+     * >= 4. Pad with PADDING frames (0x00) if the caller handed us less. */
+    uint8_t padded[4];
+    if ((size_t)pn_len + payload_len < QL_HP_SAMPLE_OFFSET) {
+        memset(padded, 0, sizeof(padded));
+        if (payload_len > 0 && payload) {
+            memcpy(padded, payload, payload_len);
+        }
+        payload_len = QL_HP_SAMPLE_OFFSET - (size_t)pn_len;
+        payload     = padded;
+    }
+
+    size_t pn_start; /* offset of the first pkt-num byte */
+
     if (hdr->is_long) {
         /* long header*/
         const ql_long_hdr_t *lh = &hdr->h.lhdr;
-        // first byte
+        // first byte, with the pkt-num-length bits (0-1) filled in
         if (pos >= cap) {
             return QLITE_ERR_BUF;
         }
-        out[pos++] = lh->first_byte;
+        out[pos++] = (uint8_t)((lh->first_byte & ~QL_LONG_HDR_PKT_NUM_MASK) | (uint8_t)(pn_len - 1));
 
         if (pos + 4 > cap) {
             return QLITE_ERR_BUF;
@@ -2538,41 +2565,25 @@ int ql_pkt_encode(const ql_pkt_hdr_t *hdr, const ql_keys_t *key, const uint8_t *
             pos += lh->token_len;
         }
 
-        /* Length (payload + AEAD tag), leave space: encode as 2-byte varint */
-        size_t length_field_pos  = pos;
-        uint64_t pkt_payload_len = payload_len + QL_AEAD_TAG_LEN;
+        /* Length covers pkt-num + payload + AEAD tag (RFC 9000 17.2).
+         * Always encode as a 2-byte varint so the field is fixed-width. */
+        uint64_t pkt_payload_len = (uint64_t)pn_len + payload_len + QL_AEAD_TAG_LEN;
         if (pkt_payload_len > QL_VARINT_2B_MAX) {
             return QLITE_ERR_BUF;
         }
         if (pos + 2 > cap) {
             return QLITE_ERR_BUF;
         }
-        /* Always encode as 2-byte varint so the field is fixed-width */
         out[pos]     = 0x40 | (uint8_t)((pkt_payload_len >> 8) & 0x3F);
         out[pos + 1] = (uint8_t)(pkt_payload_len & 0xFF);
         pos += 2;
-
-        /* Packet number — always encode as minimum width */
-        size_t pn_pos = pos;
-        int pn_len    = ql_pkt_num_encode(
-            out + pos, lh->pkt_num, QL_PKT_NUM_NONE /* simplified: chunk 2 passes largest_acked */);
-        if (pn_len < 0) {
-            return pn_len;
-        }
-        pos += (size_t)pn_len;
-
-        /* Patch first byte's pkt-num-length field (bits 0–1) */
-        out[length_field_pos - 1 /* first_byte */] =
-            (out[0] & ~QL_LONG_HDR_PKT_NUM_MASK) | (uint8_t)(pn_len - 1);
-        (void)pn_pos;
-
     } else {
         /* short header*/
         const ql_short_hdr_t *sh = &hdr->h.shdr;
         if (pos >= cap) {
             return QLITE_ERR_BUF;
         }
-        out[pos++] = sh->first_byte;
+        out[pos++] = (uint8_t)((sh->first_byte & ~QL_SHORT_HDR_PKT_NUM_MASK) | (uint8_t)(pn_len - 1));
 
         /* DCID (Length known from the conn, no length prefix 17.3)*/
         if (pos + sh->dst_cid.len > cap) {
@@ -2580,28 +2591,38 @@ int ql_pkt_encode(const ql_pkt_hdr_t *hdr, const ql_keys_t *key, const uint8_t *
         }
         memcpy(out + pos, sh->dst_cid.data, sh->dst_cid.len);
         pos += sh->dst_cid.len;
-
-        /* pkt num*/
-        int pn_len = ql_pkt_num_encode(out + pos, sh->pkt_num, QL_PKT_NUM_NONE);
-        if (pn_len < 0) {
-            return pn_len;
-        }
-        pos += (size_t)pn_len;
     }
+
+    /* Packet number - minimum width, written right after the header. */
+    if (pos + (size_t)pn_len > cap) {
+        return QLITE_ERR_BUF;
+    }
+    pn_start = pos;
+    memcpy(out + pos, pn_buf, (size_t)pn_len);
+    pos += (size_t)pn_len;
+    size_t hdr_len = pos; /* unprotected header, incl. pkt-num: the AEAD AAD */
 
     if (pos + payload_len + QL_AEAD_TAG_LEN > cap) {
         return QLITE_ERR_BUF;
     }
 
-    int sealed = ql_aead_seal(key, 0, out, pos, payload, payload_len, out + pos, cap - pos);
+    /* Nonce must be built from the real packet number (decode uses it). */
+    int sealed = ql_aead_seal(key, pkt_num, out, hdr_len, payload, payload_len, out + pos, cap - pos);
     if (sealed < 0) {
         return sealed;
     }
     pos += (size_t)sealed;
 
-    const uint8_t *sample = out + pos - QL_AEAD_TAG_LEN - payload_len + QL_HP_SAMPLE_OFFSET;
+    /* Sample sits 4 bytes after the START of the pkt-num field (5.4.2),
+     * matching what ql_pkt_decode reads. */
+    if (pn_start + QL_HP_SAMPLE_OFFSET + QL_HP_SAMPLE_LEN > pos) {
+        return QLITE_ERR_BUF;
+    }
+    const uint8_t *sample = out + pn_start + QL_HP_SAMPLE_OFFSET;
 
-    int hp = ql_hp_protect(key, out, pos, sample);
+    /* ql_hp_protect locates the pkt-num at hdr + hdr_len - pn_len, so it
+     * must be given the HEADER length, not the whole packet length. */
+    int hp = ql_hp_protect(key, out, hdr_len, sample);
     if (hp < 0) {
         return hp;
     }
@@ -4336,6 +4357,27 @@ static int ql__send_level_pkt(ql_conn_t *conn, ql_enc_level_t level, const uint8
 }
 
 /*
+ * Install any TLS-derived keys that have become available. Called right
+ * after CRYPTO data is fed to TLS so the very next packet in the same
+ * datagram burst (e.g. Initial followed by Handshake) is decryptable,
+ * instead of waiting for the next ql_conn_tick.
+ */
+static void ql__install_pending_keys(ql_conn_t *conn) {
+    for (int lvl = 0; lvl < QL_ENC_LEVEL_COUNT; lvl++) {
+        ql_key_pair_t *slot = &conn->keys[lvl];
+        if (slot->read.is_set && slot->write.is_set) {
+            continue;
+        }
+        ql_key_pair_t derived;
+        memset(&derived, 0, sizeof(derived));
+        int rc = ql_tls_install_keys(&conn->tls, (ql_enc_level_t)lvl, &derived);
+        if (rc == 0 && derived.read.is_set && derived.write.is_set) {
+            *slot = derived;
+        }
+    }
+}
+
+/*
  * ql__conn_process_datagram — chunk 7.3.1/7.3.2's per-datagram body,
  * factored out of ql_conn_tick so a server listener (chunk 7.1) can feed
  * it datagrams it already read and demuxed from its own shared socket,
@@ -4344,6 +4386,7 @@ static int ql__send_level_pkt(ql_conn_t *conn, ql_enc_level_t level, const uint8
 static void ql__conn_process_datagram(ql_conn_t *conn, uint8_t *rx_buf, size_t rn,
                                       const struct sockaddr_storage *rx_from, socklen_t rx_fromlen,
                                       uint64_t now_ms) {
+    conn->last_tick_ms = now_ms;
     if (conn->state == QL_CONN_DRAINING) {
         return; /* §10.2.2 — remain completely silent */
     }
@@ -4395,6 +4438,21 @@ static void ql__conn_process_datagram(ql_conn_t *conn, uint8_t *rx_buf, size_t r
         level = QL_ENC_LEVEL_APP;
     }
 
+    /* Initial keys depend only on the client's original DCID, so they are
+     * available as soon as ql_tls_init has run. Install them lazily here so
+     * the very first Initial packet isn't dropped before the first tick.
+     * Guarded by QL_CONN_INITIAL so a late/duplicate Initial can't resurrect
+     * keys already discarded per RFC 9001 4.9.1. */
+    if (level == QL_ENC_LEVEL_INITIAL && conn->state == QL_CONN_INITIAL &&
+        !(conn->keys[level].read.is_set && conn->keys[level].write.is_set)) {
+        ql_key_pair_t derived;
+        memset(&derived, 0, sizeof(derived));
+        if (ql_tls_install_keys(&conn->tls, level, &derived) == 0 && derived.read.is_set &&
+            derived.write.is_set) {
+            conn->keys[level] = derived;
+        }
+    }
+    
     ql_keys_t *rk = &conn->keys[level].read;
     if (!rk->is_set) {
         return; /* can't decrypt this level (yet, or ever) */
@@ -4465,10 +4523,15 @@ static void ql__conn_process_datagram(ql_conn_t *conn, uint8_t *rx_buf, size_t r
     bool ack_eliciting = false;
     int prc = ql__process_frames(conn, level, hdr.payload, hdr.payload_len, now_ms, rx_from,
                                  rx_fromlen, &ack_eliciting);
+    ql__install_pending_keys(conn);
     if (prc < 0) {
         return; /* malformed frame payload; drop the datagram */
     }
     ql__ack_record_recv(conn, space, pn, ack_eliciting, now_ms);
+}
+
+static inline uint64_t ql__conn_now(const ql_conn_t *c) {
+    return c->last_tick_ms ? c->last_tick_ms : ql_now_ms();
 }
 
 /* -------------------------------------------------------------------------
@@ -4483,7 +4546,7 @@ int ql_conn_tick(ql_conn_t *conn, uint64_t now_ms) {
     if (!conn) {
         return QLITE_ERR_ARGS;
     }
-
+    conn->last_tick_ms = now_ms;
     /* ---- 0. Idle timeout / drain timer (chunk 7.2, §10.1/10.2) ---- */
     if (conn->state == QL_CONN_CLOSING || conn->state == QL_CONN_DRAINING) {
         if (conn->timer_drain.armed && now_ms >= conn->timer_drain.deadline_ms) {
@@ -4504,7 +4567,8 @@ int ql_conn_tick(ql_conn_t *conn, uint64_t now_ms) {
                 effective = (local_adv < peer_adv) ? local_adv : peer_adv;
             }
         }
-        if (effective != 0 && now_ms - conn->last_activity_ms >= effective) {
+        if (effective != 0 && now_ms >= conn->last_activity_ms &&
+            now_ms - conn->last_activity_ms >= effective) {
             /* §10.1 — silent close: no CONNECTION_CLOSE is sent. */
             conn->state       = QL_CONN_DRAINING;
             conn->closing     = true;
@@ -4558,6 +4622,20 @@ int ql_conn_tick(ql_conn_t *conn, uint64_t now_ms) {
         }
     }
 
+    /* Start the client handshake: quictls only emits the ClientHello once
+     * SSL_do_handshake() runs, and that happens inside provide_data. A
+     * zero-length provide at INITIAL is the kick. Transport params were
+     * already set by ql__install_local_tp, as required before this point.
+     * Guarded by tx_offset == 0 so it only fires until the ClientHello has
+     * been staged. */
+    if (conn->role == QL_ROLE_CLIENT && conn->state == QL_CONN_INITIAL &&
+        conn->crypto[QL_ENC_LEVEL_INITIAL].tx_offset == 0) {
+        static const uint8_t kick_byte = 0;
+        if (ql_tls_provide_data(&conn->tls, QL_ENC_LEVEL_INITIAL, &kick_byte, 0) < 0) {
+            return QLITE_ERR_CRYPTO;
+        }
+    }
+    
     for (int lvl = 0; lvl < QL_ENC_LEVEL_COUNT; lvl++) {
         ql_enc_level_t level = (ql_enc_level_t)lvl;
         ql_crypto_buf_t *cb  = &conn->crypto[level];
@@ -5181,7 +5259,7 @@ int qlite_stream_close(ql_conn_t *conn, ql_stream_t *stream, ql_app_error_t erro
 
     int sent_idx = -1;
     int sn = ql__send_level_pkt(conn, QL_ENC_LEVEL_APP, buf, (size_t)flen, true,
-                                QL_RETX_FLAG_RESET_STREAM, ql_now_ms(), &sent_idx);
+                                QL_RETX_FLAG_RESET_STREAM, ql__conn_now(conn), &sent_idx);
     if (sn < 0) {
         return sn;
     }
@@ -5845,7 +5923,7 @@ static void ql__on_pto_timeout(ql_conn_t *conn, uint64_t now_ms) {
  * advertised. Called opportunistically from the tick loop.
  */
 static void ql__cid_issue_new(ql_conn_t *conn, uint64_t now_ms) {
-    (void)now_ms;
+    // (void)now_ms;
     if (!conn->keys[QL_ENC_LEVEL_APP].write.is_set) {
         return;
     }
@@ -5887,7 +5965,7 @@ static void ql__cid_issue_new(ql_conn_t *conn, uint64_t now_ms) {
             break;
         }
         if (ql__send_level_pkt(conn, QL_ENC_LEVEL_APP, buf, (size_t)flen, true,
-                               QL_RETX_FLAG_NEW_CID, ql_now_ms(), NULL) < 0) {
+                               QL_RETX_FLAG_NEW_CID, now_ms, NULL) < 0) {
             break; /* try again next tick */
         }
 
@@ -6053,7 +6131,7 @@ int qlite_key_update(ql_conn_t *conn) {
         return rc;
     }
 
-    ql__key_update_promote(conn, ql_now_ms());
+    ql__key_update_promote(conn, ql__conn_now(conn));
     conn->key_update.update_pending = true;
     return QLITE_OK;
 }
@@ -6127,7 +6205,7 @@ int qlite_close(ql_conn_t *conn, bool is_app, uint64_t error_code, const char *r
         return QLITE_OK;
     }
 
-    int sn = ql__send_level_pkt(conn, level, buf, (size_t)flen, false, 0, ql_now_ms(), NULL);
+    int sn = ql__send_level_pkt(conn, level, buf, (size_t)flen, false, 0, ql__conn_now(conn), NULL);
     if (sn < 0) {
         return sn;
     }
@@ -6142,7 +6220,7 @@ int qlite_close(ql_conn_t *conn, bool is_app, uint64_t error_code, const char *r
     conn->close_pkt_len = copy_len;
 
     uint64_t rtt_us = conn->cc.rtt_sample_taken ? conn->cc.smoothed_rtt_us : QL_INITIAL_RTT_US;
-    conn->timer_drain.deadline_ms = ql_now_ms() + 3 * (rtt_us / 1000 + 1);
+    conn->timer_drain.deadline_ms = ql__conn_now(conn) + 3 * (rtt_us / 1000 + 1);
     conn->timer_drain.armed       = true;
 
     conn->state   = QL_CONN_CLOSING;
