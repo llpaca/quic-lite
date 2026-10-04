@@ -249,12 +249,20 @@ TEST(test_rtt_sample_ack_delay_reduces_adjusted_rtt) {
 }
 
 TEST(test_congestion_control_initial_window_matches_rfc9002) {
-    qlite_test_pair_t p;
-    qlite_test_pair_setup(&p, NULL);
-
     /* RFC 9002 §7.2: min(10*max_datagram_size, max(2*max_datagram_size,
      * 14720)), computed with QL_PATH_MTU_DEFAULT before the real path MTU
-     * is known. */
+     * is known.
+     *
+     * Checked on a freshly-initialised connection: after a handshake the
+     * window has legitimately grown via slow start, so asserting the
+     * initial value on a post-handshake pair would be wrong. */
+    ql_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.local_params = qlite_test_default_tp();
+
+    ql_conn_t c;
+    EXPECT_EQ(ql_conn_init(&c, QL_ROLE_CLIENT, &cfg), 0);
+
     uint64_t mtu      = QL_PATH_MTU_DEFAULT;
     uint64_t expected = 10 * mtu;
     if (expected > 14720) {
@@ -264,10 +272,17 @@ TEST(test_congestion_control_initial_window_matches_rfc9002) {
         expected = 2 * mtu;
     }
 
-    EXPECT_EQ(p.client.cc.cwnd, expected);
-    EXPECT_EQ(p.client.cc.state, QL_CC_SLOW_START);
-    EXPECT_EQ(p.client.cc.ssthresh, UINT64_MAX);
+    EXPECT_EQ(c.cc.cwnd, expected);
+    EXPECT_EQ(c.cc.state, QL_CC_SLOW_START);
+    EXPECT_EQ(c.cc.ssthresh, UINT64_MAX);
 
+    ql_conn_free(&c);
+}
+
+TEST(test_cwnd_grows_in_slow_start_after_handshake) {
+    qlite_test_pair_t p;
+    qlite_test_pair_setup(&p, NULL);
+    EXPECT_GE(p.client.cc.cwnd, (uint64_t)(10 * QL_PATH_MTU_DEFAULT));
     qlite_test_pair_teardown(&p);
 }
 
@@ -348,6 +363,9 @@ TEST(test_lost_stream_data_is_retransmitted_and_still_arrives) {
     qlite_test_pair_pump(&p, 100, NULL);
 
     ql_stream_t *ss = ql_stream_find(&p.server, cs->id);
+    fprintf(stderr, "pto_deadline=%llu now=%llu pto_count=%d in_flight=%llu\n",
+            (unsigned long long)p.client.cc.pto_deadline_ms, (unsigned long long)p.now_ms,
+            p.client.cc.pto_count, (unsigned long long)p.client.cc.bytes_in_flight);
     EXPECT_NE(ss, NULL);
     uint8_t out[64];
     int n = qlite_recv(&p.server, ss, out, sizeof(out));
