@@ -35,14 +35,14 @@ typedef struct {
 static ql_transport_params_t qlite_test_default_tp(void) {
     ql_transport_params_t tp;
     memset(&tp, 0, sizeof(tp));
-    tp.max_idle_timeout_ms                   = 30000;
-    tp.initial_max_data                      = 1u << 20;
-    tp.initial_max_stream_data_bidi_local     = 1u << 16;
-    tp.initial_max_stream_data_bidi_remote    = 1u << 16;
-    tp.initial_max_stream_data_uni            = 1u << 16;
-    tp.initial_max_streams_bidi               = 16;
-    tp.initial_max_streams_uni                = 16;
-    tp.active_cid_limit                       = 4;
+    tp.max_idle_timeout_ms                 = 30000;
+    tp.initial_max_data                    = 1u << 20;
+    tp.initial_max_stream_data_bidi_local  = 1u << 16;
+    tp.initial_max_stream_data_bidi_remote = 1u << 16;
+    tp.initial_max_stream_data_uni         = 1u << 16;
+    tp.initial_max_streams_bidi            = 16;
+    tp.initial_max_streams_uni             = 16;
+    tp.active_cid_limit                    = 4;
     return tp;
 }
 
@@ -57,7 +57,7 @@ static void qlite_test_shuttle(ql_conn_t *from, ql_conn_t *to, uint64_t now_ms,
         uint8_t buf[QL_PATH_MTU_ETHERNET + 64];
         size_t len = dg->len;
         memcpy(buf, dg->data, len);
-        from->send_queue.head  = (from->send_queue.head + 1) % QL_MAX_COALESCE_PKTS;
+        from->send_queue.head = (from->send_queue.head + 1) % QL_MAX_COALESCE_PKTS;
         from->send_queue.count--;
 
         ql__conn_process_datagram(to, buf, len, from_addr, sizeof(*from_addr), now_ms);
@@ -67,12 +67,13 @@ static void qlite_test_shuttle(ql_conn_t *from, ql_conn_t *to, uint64_t now_ms,
 /* Advance the pair by `max_ticks` rounds, or until `done` says so first.
  * `done` may be NULL to just run the full budget (useful for e.g. driving
  * a fixed number of ticks past a loss injection). */
-static void qlite_test_pair_pump(qlite_test_pair_t *p, int max_ticks, bool (*done)(qlite_test_pair_t *)) {
+static void qlite_test_pair_pump(qlite_test_pair_t *p, int max_ticks,
+                                 bool (*done)(qlite_test_pair_t *)) {
     struct sockaddr_storage client_addr, server_addr;
     memset(&client_addr, 0, sizeof(client_addr));
     memset(&server_addr, 0, sizeof(server_addr));
-    client_addr.ss_family = AF_INET;
-    server_addr.ss_family = AF_INET;
+    client_addr.ss_family                          = AF_INET;
+    server_addr.ss_family                          = AF_INET;
     ((struct sockaddr_in *)&client_addr)->sin_port = htons(11111);
     ((struct sockaddr_in *)&server_addr)->sin_port = htons(22222);
 
@@ -142,10 +143,10 @@ static void qlite_test_pair_setup_ex(qlite_test_pair_t *p, const ql_transport_pa
     EXPECT_EQ(ql__install_local_tp(&p->client), 0);
     EXPECT_EQ(ql__install_local_tp(&p->server), 0);
 
-    p->client.state              = QL_CONN_INITIAL;
-    p->server.state              = QL_CONN_INITIAL;
-    p->client.active_path.state  = QL_PATH_VALIDATED;
-    p->server.active_path.state  = QL_PATH_VALIDATED;
+    p->client.state             = QL_CONN_INITIAL;
+    p->server.state             = QL_CONN_INITIAL;
+    p->client.active_path.state = QL_PATH_VALIDATED;
+    p->server.active_path.state = QL_PATH_VALIDATED;
 
     qlite_test_pair_pump(p, 200, qlite_test_both_connected);
 

@@ -395,7 +395,7 @@ TEST(test_frame_ack_with_ranges_roundtrip) {
     enc.u.ack.first_ack_range   = 10;
     enc.u.ack.has_ecn           = false;
     enc.u.ack.ranges[0].largest = 85; /* gap value on the wire */
-    enc.u.ack.ranges[0].count   = 6; /* range_len value: count-1 written */
+    enc.u.ack.ranges[0].count   = 6;  /* range_len value: count-1 written */
 
     int n = ql_frame_encode(&enc, buf, sizeof(buf));
     EXPECT_GT(n, 0);

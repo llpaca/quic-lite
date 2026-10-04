@@ -49,12 +49,15 @@ static void mock_tls_queue_outbound(mock_tls_ctx_t *m, ql_enc_level_t level, con
 static int mock_provide_data(void *ctx, ql_enc_level_t level, const uint8_t *data, size_t len) {
     mock_tls_ctx_t *m = (mock_tls_ctx_t *)ctx;
     m->provide_calls[level]++;
-    if ((int)level == m->force_provide_fail_level)
+    if ((int)level == m->force_provide_fail_level) {
         return -1;
-    if (m->inlen[level] + len > MOCK_TLS_INBUF_CAP)
+    }
+    if (m->inlen[level] + len > MOCK_TLS_INBUF_CAP) {
         return -1;
-    if (len > 0)
+    }
+    if (len > 0) {
         memcpy(m->inbuf[level] + m->inlen[level], data, len);
+    }
     m->inlen[level] += len;
     return 0;
 }
@@ -64,8 +67,9 @@ static int mock_get_data(void *ctx, ql_enc_level_t level, uint8_t *buf, size_t c
     m->get_calls[level]++;
     size_t avail = m->outlen[level] - m->outoff[level];
     size_t n     = avail < cap ? avail : cap;
-    if (n == 0)
+    if (n == 0) {
         return 0;
+    }
     memcpy(buf, m->outbuf[level] + m->outoff[level], n);
     m->outoff[level] += n;
     return (int)n;
@@ -203,8 +207,9 @@ TEST(test_tls_get_data_drains_across_multiple_small_reads) {
     mock_tls_wire(&tls, &ctx);
 
     uint8_t flight[37];
-    for (size_t i = 0; i < sizeof(flight); i++)
+    for (size_t i = 0; i < sizeof(flight); i++) {
         flight[i] = (uint8_t)i;
+    }
     mock_tls_queue_outbound(&ctx, QL_ENC_LEVEL_HANDSHAKE, flight, sizeof(flight));
 
     uint8_t drained[37] = {0};
@@ -456,8 +461,9 @@ TEST(test_tls_free_is_safe_on_null_and_zeroed) {
 
 static SSL_CTX *tls_test_make_client_ctx(void) {
     SSL_CTX *ctx = SSL_CTX_new(TLS_method());
-    if (!ctx)
+    if (!ctx) {
         return NULL;
+    }
     SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
     SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
@@ -482,8 +488,9 @@ static int tls_test_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned
 
 static SSL_CTX *tls_test_make_server_ctx(void) {
     EVP_PKEY *pkey = EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
-    if (!pkey)
+    if (!pkey) {
         return NULL;
+    }
 
     X509 *cert = X509_new();
     if (!cert) {
@@ -566,8 +573,9 @@ TEST(test_tls_real_handshake_end_to_end_via_quictls) {
     memset(ck, 0, sizeof(ck));
     memset(sk, 0, sizeof(sk));
     for (int l = 0; l < QL_ENC_LEVEL_COUNT; l++) {
-        if (l == QL_ENC_LEVEL_EARLY_DATA)
+        if (l == QL_ENC_LEVEL_EARLY_DATA) {
             continue; /* no 0-RTT in this test */
+        }
         EXPECT_EQ(ql_tls_install_keys(&ctls, (ql_enc_level_t)l, &ck[l]), 0);
         EXPECT_EQ(ql_tls_install_keys(&stls, (ql_enc_level_t)l, &sk[l]), 0);
     }

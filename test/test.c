@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define POSIX_C_SOURCE 200809L
 #include "test.h"
 #include "frames.test.h"
 #include "variant.test.h"

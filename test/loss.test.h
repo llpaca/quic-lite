@@ -131,7 +131,7 @@ TEST(test_send_ack_encodes_largest_and_first_range) {
     ql__ack_record_recv(c, QL_PN_SPACE_APP, 2, true, p.now_ms);
 
     int before = c->send_queue.count;
-    int rc        = ql__send_ack(c, QL_PN_SPACE_APP, QL_ENC_LEVEL_APP, p.now_ms);
+    int rc     = ql__send_ack(c, QL_PN_SPACE_APP, QL_ENC_LEVEL_APP, p.now_ms);
     EXPECT_GE(rc, 0);
     EXPECT_EQ(c->send_queue.count, before + 1);
     EXPECT(!c->ack[QL_PN_SPACE_APP].needs_ack); /* cleared after sending */
@@ -158,7 +158,7 @@ TEST(test_send_ack_with_multiple_ranges_roundtrips_through_wire_codec) {
     ql_ack_state_t *a = &c->ack[QL_PN_SPACE_APP];
     ql_frame_t f;
     memset(&f, 0, sizeof(f));
-    f.type                 = QL_FRAME_ACK;
+    f.type                  = QL_FRAME_ACK;
     f.u.ack.largest_acked   = a->ranges[0].largest;
     f.u.ack.first_ack_range = a->ranges[0].count - 1;
     f.u.ack.range_count     = (uint64_t)(a->range_count - 1);
@@ -225,10 +225,10 @@ TEST(test_rtt_sample_subsequent_sample_updates_smoothed_rtt) {
 TEST(test_rtt_sample_ack_delay_reduces_adjusted_rtt) {
     qlite_test_pair_t p;
     qlite_test_pair_setup(&p, NULL);
-    ql_conn_t *c              = &p.client;
-    c->remote_tp_rcvd         = true;
-    c->remote_tp.ack_delay_exponent = 0; /* so ack_delay units == microseconds directly */
-    c->handshake_confirmed    = false;   /* skip the max_ack_delay clamp for this test */
+    ql_conn_t *c                    = &p.client;
+    c->remote_tp_rcvd               = true;
+    c->remote_tp.ack_delay_exponent = 0;     /* so ack_delay units == microseconds directly */
+    c->handshake_confirmed          = false; /* skip the max_ack_delay clamp for this test */
     memset(&c->cc, 0, sizeof(c->cc));
     c->cc.min_rtt_us = UINT64_MAX;
 
@@ -325,7 +325,7 @@ static void qlite_test_shuttle_drop_one(ql_conn_t *from, ql_conn_t *to, uint64_t
         uint8_t buf[QL_PATH_MTU_ETHERNET + 64];
         size_t len = dg->len;
         memcpy(buf, dg->data, len);
-        from->send_queue.head  = (from->send_queue.head + 1) % QL_MAX_COALESCE_PKTS;
+        from->send_queue.head = (from->send_queue.head + 1) % QL_MAX_COALESCE_PKTS;
         from->send_queue.count--;
 
         if (!*dropped) {

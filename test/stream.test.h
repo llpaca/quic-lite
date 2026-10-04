@@ -68,7 +68,7 @@ TEST(test_stream_find_locates_open_stream) {
 }
 
 TEST(test_stream_open_respects_peer_max_streams_limit) {
-    ql_transport_params_t tp = qlite_test_default_tp();
+    ql_transport_params_t tp    = qlite_test_default_tp();
     tp.initial_max_streams_bidi = 2;
 
     qlite_test_pair_t p;
@@ -233,9 +233,9 @@ TEST(test_stream_peer_initiated_stream_is_auto_created) {
  * ========================================================================= */
 
 TEST(test_stream_flow_control_caps_delivery_at_recv_limit) {
-    ql_transport_params_t tp                  = qlite_test_default_tp();
-    tp.initial_max_stream_data_bidi_remote    = 64; /* what the client may send on its own streams */
-    tp.initial_max_stream_data_bidi_local     = 64;
+    ql_transport_params_t tp               = qlite_test_default_tp();
+    tp.initial_max_stream_data_bidi_remote = 64; /* what the client may send on its own streams */
+    tp.initial_max_stream_data_bidi_local  = 64;
 
     qlite_test_pair_t p;
     qlite_test_pair_setup(&p, &tp);
@@ -324,8 +324,8 @@ TEST(test_conn_level_flow_control_caps_across_streams) {
 
     /* Combined, the two streams wanted 160 bytes but the connection-level
      * limit is 100 -> total delivered across both must not exceed it. */
-    ql_stream_t *sa = ql_stream_find(&p.server, a->id);
-    ql_stream_t *sb = ql_stream_find(&p.server, b->id);
+    ql_stream_t *sa    = ql_stream_find(&p.server, a->id);
+    ql_stream_t *sb    = ql_stream_find(&p.server, b->id);
     uint64_t delivered = (sa ? sa->rx_tail : 0) + (sb ? sb->rx_tail : 0);
     EXPECT_LE(delivered, (uint64_t)100);
     EXPECT(p.client.fc.send_blocked);

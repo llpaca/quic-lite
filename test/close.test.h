@@ -113,7 +113,7 @@ TEST(test_closing_state_retransmits_close_pkt_via_socket) {
     uint8_t reply[QL_PATH_MTU_DEFAULT];
     struct sockaddr_storage from;
     socklen_t fromlen = sizeof(from);
-    int rn = -1;
+    int rn            = -1;
     for (int i = 0; i < 50 && rn < 0; i++) {
         rn = ql_udp_recv(peer_fd, reply, sizeof(reply), &from, &fromlen);
         if (rn < 0) {
@@ -170,7 +170,8 @@ TEST(test_idle_timeout_closes_silently) {
     qlite_test_pair_setup(&p, NULL);
 
     EXPECT_GT(p.client.last_activity_ms, (uint64_t)0);
-    uint64_t far_future = p.client.last_activity_ms + qlite_test_default_tp().max_idle_timeout_ms + 1000;
+    uint64_t far_future =
+        p.client.last_activity_ms + qlite_test_default_tp().max_idle_timeout_ms + 1000;
 
     int rc = ql_conn_tick(&p.client, far_future);
     EXPECT_EQ(rc, QLITE_ERR_CLOSED);
@@ -270,7 +271,7 @@ TEST(test_listener_accepts_real_client_connection) {
     EXPECT_EQ(qlite_connect(&client, "127.0.0.1", port, cctx), QLITE_OK);
 
     close_test_accepted = NULL;
-    uint64_t now_ms      = 1000;
+    uint64_t now_ms     = 1000;
     close_test_pump_real(&client, &listener, &now_ms, close_test_client_connected_and_accepted);
 
     EXPECT_EQ(client.state, QL_CONN_CONNECTED);
@@ -307,7 +308,7 @@ TEST(test_listener_sends_stateless_reset_for_unknown_short_header) {
     uint8_t bogus[32];
     memset(bogus, 0x77, sizeof(bogus));
     bogus[0] = 0x40; /* short-header form */
-    int sn = ql_udp_send(probe_fd, (struct sockaddr *)&bound, blen, bogus, sizeof(bogus));
+    int sn   = ql_udp_send(probe_fd, (struct sockaddr *)&bound, blen, bogus, sizeof(bogus));
     EXPECT_GT(sn, 0);
 
     uint64_t now_ms = 1000;
@@ -319,7 +320,7 @@ TEST(test_listener_sends_stateless_reset_for_unknown_short_header) {
         uint8_t reply[128];
         struct sockaddr_storage from;
         socklen_t fromlen = sizeof(from);
-        int rn = ql_udp_recv(probe_fd, reply, sizeof(reply), &from, &fromlen);
+        int rn            = ql_udp_recv(probe_fd, reply, sizeof(reply), &from, &fromlen);
         if (rn > 0) {
             got_reply = true;
         }

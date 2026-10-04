@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define POSIX_C_SOURCE 200809L
 #include <qlite.h>
 #include "test.h"
 #include <poll.h>

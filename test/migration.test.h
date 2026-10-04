@@ -43,10 +43,10 @@ TEST(test_cid_issuance_respects_active_cid_limit) {
 TEST(test_new_connection_id_frame_roundtrips_through_wire_codec) {
     ql_frame_t f;
     memset(&f, 0, sizeof(f));
-    f.type                        = QL_FRAME_NEW_CONNECTION_ID;
-    f.u.new_cid.sequence_num       = 3;
-    f.u.new_cid.retire_prior_to    = 1;
-    f.u.new_cid.cid.len            = 8;
+    f.type                      = QL_FRAME_NEW_CONNECTION_ID;
+    f.u.new_cid.sequence_num    = 3;
+    f.u.new_cid.retire_prior_to = 1;
+    f.u.new_cid.cid.len         = 8;
     memset(f.u.new_cid.cid.data, 0xAB, 8);
     memset(f.u.new_cid.stateless_reset_token.data, 0xCD, QL_RESET_TOKEN_LEN);
 
@@ -77,7 +77,7 @@ TEST(test_retire_connection_id_marks_local_cid_retired) {
     /* Server asks to retire one of the client's issued CIDs. */
     ql_frame_t f;
     memset(&f, 0, sizeof(f));
-    f.type                    = QL_FRAME_RETIRE_CONNECTION_ID;
+    f.type                      = QL_FRAME_RETIRE_CONNECTION_ID;
     f.u.retire_cid.sequence_num = victim_seq;
     uint8_t buf[16];
     int flen = ql_frame_encode(&f, buf, sizeof(buf));
@@ -121,9 +121,9 @@ TEST(test_path_challenge_frame_roundtrips_through_wire_codec) {
     ql_frame_t decoded;
     int dn = ql_frame_decode(buf, (size_t)n, &decoded);
     EXPECT_EQ(dn, n);
-    EXPECT_EQ(memcmp(decoded.u.path_challenge.data.data, f.u.path_challenge.data.data,
-                     QL_PATH_DATA_LEN),
-              0);
+    EXPECT_EQ(
+        memcmp(decoded.u.path_challenge.data.data, f.u.path_challenge.data.data, QL_PATH_DATA_LEN),
+        0);
 }
 
 TEST(test_path_challenge_is_echoed_as_path_response) {
@@ -153,7 +153,7 @@ TEST(test_path_challenge_is_echoed_as_path_response) {
      * decoded with the client's read key (the actual intended
      * recipient's key — same secret, independently derived), contain a
      * PATH_RESPONSE with the same 8 bytes. */
-    int idx           = (p.server.send_queue.tail - 1 + QL_MAX_COALESCE_PKTS) % QL_MAX_COALESCE_PKTS;
+    int idx = (p.server.send_queue.tail - 1 + QL_MAX_COALESCE_PKTS) % QL_MAX_COALESCE_PKTS;
     ql_datagram_t *dg = &p.server.send_queue.datagrams[idx];
     EXPECT_EQ(memcmp(&dg->dest, &addr, sizeof(addr)), 0);
 
@@ -169,9 +169,9 @@ TEST(test_path_challenge_is_echoed_as_path_response) {
     int fn = ql_frame_decode(hdr.payload, hdr.payload_len, &decoded);
     EXPECT_GT(fn, 0);
     EXPECT_EQ(decoded.type, QL_FRAME_PATH_RESPONSE);
-    EXPECT_EQ(memcmp(decoded.u.path_response.data.data, f.u.path_challenge.data.data,
-                     QL_PATH_DATA_LEN),
-              0);
+    EXPECT_EQ(
+        memcmp(decoded.u.path_response.data.data, f.u.path_challenge.data.data, QL_PATH_DATA_LEN),
+        0);
 
     qlite_test_pair_teardown(&p);
 }
@@ -188,9 +188,9 @@ TEST(test_migration_from_new_address_is_validated_and_promoted) {
     memset(&client_addr, 0, sizeof(client_addr));
     memset(&server_addr, 0, sizeof(server_addr));
     memset(&new_client_addr, 0, sizeof(new_client_addr));
-    client_addr.ss_family     = AF_INET;
-    server_addr.ss_family     = AF_INET;
-    new_client_addr.ss_family = AF_INET;
+    client_addr.ss_family                              = AF_INET;
+    server_addr.ss_family                              = AF_INET;
+    new_client_addr.ss_family                          = AF_INET;
     ((struct sockaddr_in *)&client_addr)->sin_port     = htons(11111);
     ((struct sockaddr_in *)&server_addr)->sin_port     = htons(22222);
     ((struct sockaddr_in *)&new_client_addr)->sin_port = htons(33333);
