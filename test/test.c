@@ -173,6 +173,7 @@ int main(void) {
     RUN_TEST(test_rtt_sample_subsequent_sample_updates_smoothed_rtt);
     RUN_TEST(test_rtt_sample_ack_delay_reduces_adjusted_rtt);
     RUN_TEST(test_congestion_control_initial_window_matches_rfc9002);
+    RUN_TEST(test_cwnd_grows_in_slow_start_after_handshake);
     RUN_TEST(test_sent_packets_are_marked_acked_after_real_roundtrip);
     RUN_TEST(test_lost_stream_data_is_retransmitted_and_still_arrives);
     RUN_TEST(test_pto_arms_when_ack_eliciting_packet_outstanding);
