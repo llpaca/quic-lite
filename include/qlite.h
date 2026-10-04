@@ -4316,6 +4316,13 @@ static int ql__send_level_pkt_to(ql_conn_t *conn, ql_enc_level_t level, const ui
     conn->next_pn[space] = pn + 1;
 
     int idx                              = conn->sent_pkt_tail;
+    /* If the ring is full we're about to overwrite its oldest entry; give
+     * back any in-flight budget it still holds so the counter can't leak. */
+    if (conn->sent_pkt_count == QL_SENT_PKT_MAX && conn->sent_pkts[idx].in_flight) {
+        conn->cc.bytes_in_flight = (conn->cc.bytes_in_flight >= conn->sent_pkts[idx].in_flight_bytes)
+                                       ? conn->cc.bytes_in_flight - conn->sent_pkts[idx].in_flight_bytes
+                                       : 0;
+    }
     conn->sent_pkts[idx].pkt_num         = pn;
     conn->sent_pkts[idx].pn_space        = space;
     conn->sent_pkts[idx].sent_at_ms      = now_ms;
@@ -4332,6 +4339,10 @@ static int ql__send_level_pkt_to(ql_conn_t *conn, ql_enc_level_t level, const ui
         /* Ring is full: the slot we just overwrote (== old head) is now
          * the newest entry, so the true oldest entry moved forward one. */
         conn->sent_pkt_head = (conn->sent_pkt_head + 1) % QL_SENT_PKT_MAX;
+    }
+
+    if (ack_eliciting) {
+        conn->cc.bytes_in_flight += (uint64_t)n; /* RFC 9002 B.4: counted until acked or lost */
     }
 
     conn->bytes_sent_total += (uint64_t)n;
@@ -4354,6 +4365,32 @@ static int ql__send_level_pkt(ql_conn_t *conn, ql_enc_level_t level, const uint8
     return ql__send_level_pkt_to(conn, level, payload, payload_len, ack_eliciting, frame_flags,
                                  now_ms, &conn->active_path.peer_addr, conn->active_path.peer_addrlen,
                                  out_idx);
+}
+
+/*
+ * ql__discard_pn_space — RFC 9002 §6.4: when the keys for a packet-number
+ * space are discarded, forget everything outstanding in it. Its packets can
+ * never be acknowledged any more, so they must stop counting toward
+ * bytes_in_flight, stop driving the PTO, and stop owing ACKs.
+ */
+static void ql__discard_pn_space(ql_conn_t *conn, ql_pn_space_t space) {
+    for (int i = 0; i < conn->sent_pkt_count; i++) {
+        ql_sent_pkt_t *sp = &conn->sent_pkts[(conn->sent_pkt_head + i) % QL_SENT_PKT_MAX];
+        if (sp->pn_space != space) {
+            continue;
+        }
+        if (sp->in_flight) {
+            conn->cc.bytes_in_flight = (conn->cc.bytes_in_flight >= sp->in_flight_bytes)
+                                           ? conn->cc.bytes_in_flight - sp->in_flight_bytes
+                                           : 0;
+        }
+        sp->in_flight     = false;
+        sp->ack_eliciting = false;
+        sp->is_acked      = true; /* not "really" acked; just retired so later scans skip it */
+    }
+    conn->cc.loss_time[space]   = 0;
+    conn->cc.pto_count          = 0;
+    conn->ack[space].needs_ack  = false;
 }
 
 /*
@@ -4865,8 +4902,12 @@ int ql_conn_tick(ql_conn_t *conn, uint64_t now_ms) {
 
             /* Receive-side per-stream window update: extend once the app
              * has consumed roughly half of the currently-advertised limit. */
-            if (s->fc.recv_limit > (uint64_t)(QL_STREAM_BUF_SIZE / 2) &&
-                s->fc.recv_consumed >= s->fc.recv_limit - QL_STREAM_BUF_SIZE / 2 &&
+            uint64_t s_half = s->fc.recv_limit / 2;
+            if (s_half > (uint64_t)(QL_STREAM_BUF_SIZE / 2)) {
+                s_half = (uint64_t)(QL_STREAM_BUF_SIZE / 2);
+            }
+            if (s->fc.recv_limit > 0 &&
+                s->fc.recv_consumed >= s->fc.recv_limit - s_half &&
                 s->rx_state != QL_RX_STREAM_RESET_RCVD && s->rx_state != QL_RX_STREAM_RESET_READ) {
                 uint64_t new_limit = s->fc.recv_consumed + QL_STREAM_BUF_SIZE;
                 if (new_limit > s->fc.recv_limit) {
@@ -4887,8 +4928,12 @@ int ql_conn_tick(ql_conn_t *conn, uint64_t now_ms) {
         }
 
         /* Connection-level receive-side window update. */
-        if (conn->fc.recv_limit > (uint64_t)(QL_CONN_FC_WINDOW_DEFAULT / 2) &&
-            conn->fc.recv_consumed >= conn->fc.recv_limit - QL_CONN_FC_WINDOW_DEFAULT / 2) {
+        uint64_t c_half = conn->fc.recv_limit / 2;
+        if (c_half > (uint64_t)(QL_CONN_FC_WINDOW_DEFAULT / 2)) {
+            c_half = (uint64_t)(QL_CONN_FC_WINDOW_DEFAULT / 2);
+        }
+        if (conn->fc.recv_limit > 0 &&
+            conn->fc.recv_consumed >= conn->fc.recv_limit - c_half) {
             uint64_t new_limit = conn->fc.recv_consumed + QL_CONN_FC_WINDOW_DEFAULT;
             if (new_limit > conn->fc.recv_limit) {
                 ql_frame_t mf;
@@ -4936,17 +4981,20 @@ int ql_conn_tick(ql_conn_t *conn, uint64_t now_ms) {
     if (conn->keys[QL_ENC_LEVEL_HANDSHAKE].read.is_set &&
         conn->keys[QL_ENC_LEVEL_HANDSHAKE].write.is_set && conn->keys[QL_ENC_LEVEL_INITIAL].read.is_set) {
         memset(&conn->keys[QL_ENC_LEVEL_INITIAL], 0, sizeof(conn->keys[QL_ENC_LEVEL_INITIAL]));
+        ql__discard_pn_space(conn, QL_PN_SPACE_INITIAL);
     }
 
     bool confirmed = (conn->role == QL_ROLE_SERVER)
                           ? conn->handshake_confirmed
                           : (conn->handshake_complete && conn->handshake_confirmed);
 
-    if (confirmed && conn->state != QL_CONN_CONNECTED) {
+    if (confirmed && conn->state != QL_CONN_CONNECTED && conn->state != QL_CONN_CLOSING &&
+        conn->state != QL_CONN_DRAINING) {
         conn->state = QL_CONN_CONNECTED;
         /* RFC 9001 4.9.2 — Handshake keys are discarded once the
          * handshake is confirmed. */
         memset(&conn->keys[QL_ENC_LEVEL_HANDSHAKE], 0, sizeof(conn->keys[QL_ENC_LEVEL_HANDSHAKE]));
+        ql__discard_pn_space(conn, QL_PN_SPACE_HANDSHAKE);
         if (conn->cfg.on_connected) {
             conn->cfg.on_connected(conn, conn->cfg.user);
         }
@@ -5734,7 +5782,8 @@ static void ql__rtt_sample(ql_conn_t *conn, uint64_t sent_at_ms, uint64_t ack_de
  */
 static void ql__process_ack_frame(ql_conn_t *conn, ql_pn_space_t space, const ql_frame_ack_t *ack,
                                   uint64_t now_ms) {
-    bool newly_acked_largest    = false;
+    bool largest_newly_acked       = false;
+    bool any_ack_eliciting_newly   = false;
     uint64_t largest_acked_sent_at = 0;
 
     ql_pkt_num_t hi = ack->largest_acked;
@@ -5755,16 +5804,25 @@ static void ql__process_ack_frame(ql_conn_t *conn, ql_pn_space_t space, const ql
                 continue;
             }
             sp->is_acked = true;
-            if (sp->pkt_num == ack->largest_acked && sp->ack_eliciting) {
-                newly_acked_largest      = true;
-                largest_acked_sent_at    = sp->sent_at_ms;
+            if (sp->ack_eliciting) {
+                any_ack_eliciting_newly = true;
+            }
+            if (sp->pkt_num == ack->largest_acked) {
+                largest_newly_acked   = true;
+                largest_acked_sent_at = sp->sent_at_ms;
             }
             ql__on_pkt_acked(conn, sp);
         }
     }
 
-    if (newly_acked_largest) {
+    /* RFC 9002 §5.1: sample RTT when the largest acknowledged packet is
+     * newly acked AND at least one newly acked packet was ack-eliciting
+     * (the largest itself may be an ACK-only packet). */
+    if (largest_newly_acked && any_ack_eliciting_newly) {
         ql__rtt_sample(conn, largest_acked_sent_at, ack->ack_delay, now_ms);
+    }
+    if (any_ack_eliciting_newly) {
+        conn->cc.pto_count = 0; /* RFC 9002 §6.2.1: progress was made, reset PTO backoff */
     }
 
     /* A fresh ACK can retroactively push older unacked packets past the
@@ -5868,7 +5926,19 @@ static void ql__set_loss_detection_timer(ql_conn_t *conn, uint64_t now_ms) {
     int shift = conn->cc.pto_count < 32 ? conn->cc.pto_count : 32;
     pto_us <<= shift;
 
-    conn->cc.pto_deadline_ms = now_ms + pto_us / 1000;
+    /* RFC 9002 §6.2.1: the PTO is measured from when the most recent
+     * ack-eliciting packet was sent, NOT from "now". Anchoring to now
+     * would slide the deadline forward on every call and it would never
+     * fire. */
+    uint64_t last_sent_ms = 0;
+    for (int j = 0; j < conn->sent_pkt_count; j++) {
+        ql_sent_pkt_t *sp = &conn->sent_pkts[(conn->sent_pkt_head + j) % QL_SENT_PKT_MAX];
+        if (sp->in_flight && !sp->is_acked && !sp->is_lost && sp->sent_at_ms > last_sent_ms) {
+            last_sent_ms = sp->sent_at_ms;
+        }
+    }
+    uint64_t base_ms = last_sent_ms ? last_sent_ms : now_ms;
+    conn->cc.pto_deadline_ms = base_ms + pto_us / 1000;
 }
 
 /*
