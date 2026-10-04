@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -Werror -g \
+CFLAGS := -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic -Werror -g \
           -fsanitize=address,undefined
 INCLUDES := -Iinclude -I"$(HOME)/quictls-install/include"
 LDFLAGS  := -L"$(HOME)/quictls-install/lib64" -Wl,-rpath,"$(HOME)/quictls-install/lib64"
