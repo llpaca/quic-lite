@@ -12,6 +12,7 @@
 #include "loss.test.h"
 #include "migration.test.h"
 #include "close.test.h"
+#include "extra.test.h"
 
 int ql_tests_run = 0;
 
@@ -205,6 +206,32 @@ int main(void) {
     RUN_TEST(test_listener_accepts_real_client_connection);
     RUN_TEST(test_listener_sends_stateless_reset_for_unknown_short_header);
 
+    /* extra tests - given by ai */
+    RUN_TEST(test_varint_encoded_len_boundaries);
+    RUN_TEST(test_varint_encode_rejects_small_buffer_and_overflow);
+    RUN_TEST(test_pkt_num_encode_width_grows_with_gap);
+    RUN_TEST(test_pkt_num_decode_rfc9000_appendix_a3_example);
+    RUN_TEST(test_vn_roundtrip);
+    RUN_TEST(test_vn_encode_decode_error_paths);
+    RUN_TEST(test_pkt_short_roundtrip_with_real_keys);
+    RUN_TEST(test_pkt_long_initial_roundtrip_with_real_keys);
+    RUN_TEST(test_pkt_decode_parses_retry_without_aead);
+    RUN_TEST(test_pkt_decode_routes_version_negotiation_away);
+    RUN_TEST(test_frame_decode_truncated_prefixes_never_overread);
+    RUN_TEST(test_tp_decode_rejects_invalid_values);
+    RUN_TEST(test_tp_decode_truncated_prefixes_never_overread);
+    RUN_TEST(test_decoders_survive_random_garbage);
+    RUN_TEST(test_pkt_decode_rejects_random_garbage);
+    RUN_TEST(test_conn_init_defaults_and_arg_checks);
+    RUN_TEST(test_ack_record_out_of_order_arrivals_then_merge);
+    RUN_TEST(test_ack_record_range_table_is_bounded);
+    RUN_TEST(test_connect_argument_validation);
+    RUN_TEST(test_close_before_handshake_goes_straight_to_draining);
+    RUN_TEST(test_close_reason_phrase_is_truncated_to_buffer);
+    RUN_TEST(test_stream_send_backpressure_when_buffer_full);
+    RUN_TEST(test_bidirectional_streams_simultaneously);
+    
+    
     ql_test_summary();
     return 0;
 }
