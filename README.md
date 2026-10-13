@@ -1,4 +1,3 @@
-
 # quic-lite
 
 [![CI](https://github.com/llpaca/quic-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/llpaca/quic-lite/actions/workflows/ci.yml)
