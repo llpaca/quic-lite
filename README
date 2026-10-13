@@ -1,0 +1,275 @@
+
+# quic-lite
+
+[![CI](https://github.com/llpaca/quic-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/llpaca/quic-lite/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/llpaca/quic-lite/actions/workflows/codeql.yml/badge.svg)](https://github.com/llpaca/quic-lite/actions/workflows/codeql.yml)
+[![Language](https://img.shields.io/badge/language-C11-blue.svg)](https://en.cppreference.com/w/c/11.html)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+**quic-lite** is a single-header C implementation of the QUIC v1 transport protocol, built around UDP and [quictls](https://github.com/quictls/openssl) for TLS 1.3 integration.
+
+The project focuses on implementing the core mechanisms behind QUIC, including packet encoding and protection, encrypted handshakes, multiplexed streams, flow control, and loss recovery.
+
+> **Status:** Work in progress. This is an experimental implementation intended for systems programming, protocol development, and learning. It has known protocol gaps and should not be treated as production-ready or fully RFC-compliant.
+
+## Features
+
+### Protocol and packet handling
+
+- QUIC v1 packet structures and header encoding/decoding.
+- Variable-length integer encoding and decoding.
+- Connection IDs and packet number spaces.
+- Frame encoding and decoding, including STREAM, CRYPTO, ACK, PADDING, PING, and connection-control frames.
+- Transport parameter encoding and decoding.
+- Packet number reconstruction and header protection.
+
+### Cryptography and TLS
+
+- TLS 1.3 handshake integration using quictls.
+- Initial, Handshake, and 1-RTT packet protection.
+- AEAD encryption and authentication.
+- QUIC header protection.
+- TLS traffic-secret and packet-key derivation.
+- Application traffic key updates.
+
+### Streams and flow control
+
+- Bidirectional and unidirectional streams.
+- Stream send and receive buffers.
+- Out-of-order stream-data reassembly.
+- Stream FIN and RESET_STREAM handling.
+- Stream-level and connection-level flow control.
+- MAX_DATA, MAX_STREAM_DATA, and stream-limit management.
+
+### Loss recovery and congestion control
+
+- ACK range tracking and acknowledgment processing.
+- RTT estimation and packet loss detection.
+- Probe Timeout (PTO) handling.
+- In-flight packet accounting and retransmission of supported data.
+- NewReno-style congestion control.
+- Idle timeout and connection closing/draining states.
+
+### Connection management
+
+- Client-side connection establishment.
+- Server-side UDP listener and connection demultiplexing.
+- Connection ID issuance and retirement.
+- Stateless reset generation.
+- Path validation and connection migration mechanisms.
+- Configurable connection callbacks.
+
+## Prerequisites
+
+The project targets Linux and requires:
+
+- GCC or a compatible C compiler.
+- GNU Make.
+- Git, Perl, and standard build tools.
+- A compatible quictls build exposing the QUIC-specific TLS APIs.
+- OpenSSL-compatible headers and libraries supplied by that quictls installation.
+
+The current build instructions use GCC with C11 and POSIX APIs.
+
+### Install build dependencies
+
+**Arch Linux**
+
+```bash
+sudo pacman -S --needed git base-devel perl
+```
+
+**Ubuntu / Debian**
+
+```bash
+sudo apt update
+sudo apt install -y git build-essential perl
+```
+
+### Build and install quictls
+
+The following commands build the `openssl-3.1.4-quic1` reference used by the project.
+
+Run these commands from your project directory:
+
+```bash
+git clone --branch openssl-3.1.4-quic1 --depth 1 \
+    https://github.com/quictls/openssl.git quictls-src
+
+cd quictls-src
+
+./config --prefix="$HOME/quictls-install" --libdir=lib64
+
+make -j"$(nproc)"
+make install_sw
+
+cd -
+```
+
+This installs quictls under:
+
+```text
+$HOME/quictls-install/
+├── bin/
+├── include/
+└── lib64/
+```
+
+Verify the installation:
+
+```bash
+"$HOME/quictls-install/bin/openssl" version
+ls "$HOME/quictls-install/lib64"
+```
+
+**Note:** The quictls reference is pinned to a specific branch name. If you change the quictls version, verify compatibility with the QUIC TLS APIs used by `qlite.h`.
+
+## Build
+
+Include `qlite.h` in your application and link against the quictls libraries.
+
+For example, if your project contains:
+
+```text
+quic-lite/
+├── qlite.h
+├── main.c
+└── Makefile
+```
+
+### Makefile
+
+```makefile
+CC = gcc
+
+CFLAGS = -std=c11 -D_POSIX_C_SOURCE=200809L \
+         -Wall -Wextra -Wpedantic -Werror -g \
+         -fsanitize=address,undefined \
+         -I. -I$(HOME)/quictls-install/include
+
+LDFLAGS = -L$(HOME)/quictls-install/lib64 \
+          -Wl,-rpath,$(HOME)/quictls-install/lib64
+
+LDLIBS = -lssl -lcrypto
+
+main: main.c qlite.h
+	$(CC) $(CFLAGS) main.c -o main $(LDFLAGS) $(LDLIBS)
+
+clean:
+	rm -f main
+
+.PHONY: clean
+```
+
+Build and run:
+
+```bash
+make
+./main
+```
+
+Clean the build:
+
+```bash
+make clean
+```
+
+AddressSanitizer and UndefinedBehaviorSanitizer are enabled for development. Remove `-fsanitize=address,undefined` when building without sanitizers.
+
+**Single-header integration:** The current header contains function definitions as well as type definitions and does not use a separate implementation macro. Include it in only one translation unit per executable to avoid duplicate symbol definitions.
+
+### Compile directly
+
+You can also compile without a Makefile:
+
+```bash
+gcc -std=c11 -D_POSIX_C_SOURCE=200809L \
+    -Wall -Wextra -Wpedantic -Werror -g \
+    -fsanitize=address,undefined \
+    -I. -I"$HOME/quictls-install/include" \
+    main.c -o main \
+    -L"$HOME/quictls-install/lib64" \
+    -Wl,-rpath,"$HOME/quictls-install/lib64" \
+    -lssl -lcrypto
+```
+
+## API overview
+
+The public API is defined in `qlite.h`.
+
+| Function | Purpose |
+|---|---|
+| `ql_conn_init()` | Initialize a connection and its protocol state. |
+| `qlite_connect()` | Initialize a client connection to a remote IPv4 endpoint. |
+| `ql_conn_tick()` | Process network input, advance TLS and protocol state, and flush outgoing datagrams. |
+| `qlite_stream_open()` | Open a bidirectional or unidirectional stream. |
+| `qlite_send()` | Buffer application data for transmission on a stream. |
+| `qlite_recv()` | Read available stream data. |
+| `qlite_stream_close()` | Gracefully finish or reset a stream. |
+| `qlite_key_update()` | Request an application traffic-key update. |
+| `qlite_close()` | Initiate connection shutdown. |
+| `qlite_listen()` | Create a server UDP listener. |
+| `qlite_listener_tick()` | Receive and dispatch datagrams and advance server connections. |
+| `qlite_accept()` | Retrieve a connection whose handshake has completed. |
+| `ql_conn_free()` | Release connection-owned resources. |
+
+The TLS context is supplied by the application. Configure its TLS version, certificate and private key where applicable, peer-verification policy, and application protocol negotiation before passing it to the library.
+
+The application is responsible for driving the connection or listener tick functions from its event loop and handling stream and connection callbacks.
+
+Consult the function definitions and associated comments in `qlite.h` for argument requirements and return values.
+
+## Current limitations
+
+This project is under active development. The current implementation has known limitations, including:
+
+- **Address validation:** Retry-based address validation is not implemented in the listener, even when `require_address_validation` is configured.
+- **Loss recovery:** PTO probing is simplified compared with the full behavior described in RFC 9002.
+- **Retransmission:** Some control-frame retransmission cases, including RESET_STREAM after loss, are simplified or incomplete.
+- **Client networking:** The client connection bootstrap currently supports IPv4 only.
+- **Interoperability:** Full compliance with all mandatory QUIC behaviors and interoperability with independent QUIC implementations have not been established.
+
+Other features may have additional restrictions. The presence of a frame encoder or decoder does not necessarily mean every corresponding protocol behavior is fully implemented.
+
+## Documentation
+
+The following IETF RFCs are the primary protocol references for this project.
+
+- **[RFC 9000 — QUIC: A UDP-Based Multiplexed and Secure Transport](https://www.rfc-editor.org/rfc/rfc9000.html)**  
+  Packet formats, variable-length integers, frame encoding, transport parameters, connection IDs, streams, flow control, and connection management.
+
+- **[RFC 9001 — Using TLS to Secure QUIC](https://www.rfc-editor.org/rfc/rfc9001.html)**  
+  TLS 1.3 integration, CRYPTO frames, packet protection, key derivation, encryption levels, and key updates.
+
+- **[RFC 9002 — QUIC Loss Detection and Congestion Control](https://www.rfc-editor.org/rfc/rfc9002.html)**  
+  ACK processing, RTT estimation, loss detection, PTO, bytes in flight, and congestion control.
+
+- **[RFC 8999 — Version-Independent Properties of QUIC](https://www.rfc-editor.org/rfc/rfc8999.html)**  
+  Version-independent packet properties and invariants.
+
+For additional specifications and extensions, see the [IETF QUIC working group](https://datatracker.ietf.org/group/quic/documents/).
+
+## Security
+
+This project implements security-sensitive transport and cryptographic logic. It is experimental and has not been established as suitable for production deployment.
+
+Do not rely on it to protect sensitive traffic in production environments. Security testing, interoperability testing, fuzzing, and review against the relevant RFC requirements are important before considering broader use.
+
+To report a vulnerability, avoid publishing exploit details in a public issue until a responsible disclosure process has been established.
+
+## Contributing
+
+Contributions are welcome, particularly in the following areas:
+
+- Protocol correctness and RFC conformance.
+- Parser robustness and malformed-packet handling.
+- Fuzz testing and sanitizer coverage.
+- Loss recovery and congestion-control improvements.
+- Interoperability testing against established QUIC implementations.
+- Documentation and reproducible test cases.
+
+When submitting a change, include a clear description of the behavior being changed and tests demonstrating the expected result.
+
+## License
+
+The source header identifies the project as MIT-licensed. See the [`LICENSE`](LICENSE) file for the license terms.
