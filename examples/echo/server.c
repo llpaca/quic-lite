@@ -134,5 +134,6 @@ int main(int argc, char **argv) {
     }
     close(l->fd);
     SSL_CTX_free(ctx);
+    free(l);
     return 0;
 }
