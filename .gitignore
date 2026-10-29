@@ -1,2 +1,5 @@
 builds/
 .env
+*.pem
+server
+client
