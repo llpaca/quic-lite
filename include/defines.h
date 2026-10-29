@@ -4,6 +4,7 @@
  * 
  * DATE: 2026-10-26
  */
+#pragma once
 
 #define QL_VARINT_MAX UINT64_C(4611686018427387903) /* 2^62 − 1  16 */
 #define QL_VARINT_1B_MAX UINT64_C(63)
