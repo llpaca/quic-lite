@@ -230,8 +230,7 @@ int main(void) {
     RUN_TEST(test_close_reason_phrase_is_truncated_to_buffer);
     RUN_TEST(test_stream_send_backpressure_when_buffer_full);
     RUN_TEST(test_bidirectional_streams_simultaneously);
-    
-    
+
     ql_test_summary();
     return 0;
 }

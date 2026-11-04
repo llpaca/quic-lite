@@ -1,7 +1,7 @@
 /**
  * @file: frame.h
  * @brief: the frame types struct declarations
- * 
+ *
  * DATE     2026-10-29
  */
 
@@ -10,7 +10,6 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "defines.h"
-
 
 /* Packet number 12.3 — 62-bit per-packet-number-space counter */
 typedef uint64_t ql_pkt_num_t;

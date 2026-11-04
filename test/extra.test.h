@@ -81,9 +81,9 @@ TEST(test_vn_roundtrip) {
     memset(vn.dst_cid.data, 0x11, 8);
     vn.src_cid.len = 4;
     memset(vn.src_cid.data, 0x22, 4);
-    vn.versions[0]    = QL_VERSION_1;
-    vn.versions[1]    = (uint32_t)0x6b3343cf;
-    vn.version_count  = 2;
+    vn.versions[0]   = QL_VERSION_1;
+    vn.versions[1]   = (uint32_t)0x6b3343cf;
+    vn.version_count = 2;
 
     uint8_t buf[64];
     int n = ql_vn_encode(&vn, buf, sizeof(buf));
@@ -134,10 +134,10 @@ TEST(test_pkt_short_roundtrip_with_real_keys) {
 
     ql_pkt_hdr_t h;
     memset(&h, 0, sizeof(h));
-    h.is_long             = false;
-    h.h.shdr.first_byte   = QL_SHORT_HDR_FIXED_BIT;
-    h.h.shdr.dst_cid      = cid;
-    h.h.shdr.pkt_num      = 5;
+    h.is_long           = false;
+    h.h.shdr.first_byte = QL_SHORT_HDR_FIXED_BIT;
+    h.h.shdr.dst_cid    = cid;
+    h.h.shdr.pkt_num    = 5;
 
     uint8_t payload[32];
     for (size_t i = 0; i < sizeof(payload); i++) {
@@ -173,7 +173,7 @@ TEST(test_pkt_long_initial_roundtrip_with_real_keys) {
 
     ql_pkt_hdr_t h;
     memset(&h, 0, sizeof(h));
-    h.is_long = true;
+    h.is_long         = true;
     ql_long_hdr_t *lh = &h.h.lhdr;
     lh->pkt_type      = QL_PKT_INITIAL;
     lh->first_byte    = (uint8_t)(QL_LONG_HDR_FORM | QL_LONG_HDR_FIXED_BIT);
@@ -212,7 +212,7 @@ TEST(test_pkt_decode_parses_retry_without_aead) {
     fill_keys(&k, 0x01, 16);
 
     uint8_t wire[32];
-    size_t pos = 0;
+    size_t pos  = 0;
     wire[pos++] = 0xF0; /* long header, type bits = 3 (Retry) */
     wire[pos++] = 0x00;
     wire[pos++] = 0x00;
@@ -290,15 +290,15 @@ TEST(test_frame_decode_truncated_prefixes_never_overread) {
     extra_decode_all_prefixes(buf, (size_t)n);
 
     memset(&f, 0, sizeof(f));
-    f.type                      = QL_FRAME_ACK;
-    f.u.ack.largest_acked       = 100;
-    f.u.ack.first_ack_range     = 10;
-    f.u.ack.range_count         = 2;
-    f.u.ack.ranges[0].largest   = 85;
-    f.u.ack.ranges[0].count     = 6;
-    f.u.ack.ranges[1].largest   = 70;
-    f.u.ack.ranges[1].count     = 3;
-    n                           = ql_frame_encode(&f, buf, sizeof(buf));
+    f.type                    = QL_FRAME_ACK;
+    f.u.ack.largest_acked     = 100;
+    f.u.ack.first_ack_range   = 10;
+    f.u.ack.range_count       = 2;
+    f.u.ack.ranges[0].largest = 85;
+    f.u.ack.ranges[0].count   = 6;
+    f.u.ack.ranges[1].largest = 70;
+    f.u.ack.ranges[1].count   = 3;
+    n                         = ql_frame_encode(&f, buf, sizeof(buf));
     EXPECT_GT(n, 0);
     extra_decode_all_prefixes(buf, (size_t)n);
 
@@ -335,7 +335,7 @@ TEST(test_frame_decode_truncated_prefixes_never_overread) {
 TEST(test_tp_decode_rejects_invalid_values) {
     ql_transport_params_t t;
 
-    static const uint8_t bad_ack_exp[]  = {0x0A, 0x01, 21};
+    static const uint8_t bad_ack_exp[]   = {0x0A, 0x01, 21};
     static const uint8_t bad_cid_limit[] = {0x0E, 0x01, 0x01};
     static const uint8_t bad_max_delay[] = {0x0B, 0x04, 0x80, 0x00, 0x40, 0x00}; /* 16384 */
     static const uint8_t trunc_value[]   = {0x04, 0x04, 0x80};
@@ -354,7 +354,7 @@ TEST(test_tp_decode_rejects_invalid_values) {
 }
 
 TEST(test_tp_decode_truncated_prefixes_never_overread) {
-    ql_transport_params_t tp = qlite_test_default_tp();
+    ql_transport_params_t tp     = qlite_test_default_tp();
     tp.has_stateless_reset_token = true;
     memset(tp.stateless_reset_token.data, 0x07, QL_RESET_TOKEN_LEN);
     tp.initial_src_cid.len = 8;
@@ -381,7 +381,7 @@ TEST(test_tp_decode_truncated_prefixes_never_overread) {
 TEST(test_decoders_survive_random_garbage) {
     extra_lcg_state = 0xC0FFEEu;
     for (int i = 0; i < 20000; i++) {
-        size_t n = 1 + (extra_rand() % 80);
+        size_t n   = 1 + (extra_rand() % 80);
         uint8_t *b = (uint8_t *)malloc(n);
         EXPECT_NE(b, NULL);
         for (size_t j = 0; j < n; j++) {
@@ -403,7 +403,7 @@ TEST(test_pkt_decode_rejects_random_garbage) {
     extra_lcg_state = 0xBADC0DEu;
 
     for (int i = 0; i < 5000; i++) {
-        size_t n = 2 + (extra_rand() % 200);
+        size_t n   = 2 + (extra_rand() % 200);
         uint8_t *b = (uint8_t *)malloc(n);
         EXPECT_NE(b, NULL);
         for (size_t j = 0; j < n; j++) {

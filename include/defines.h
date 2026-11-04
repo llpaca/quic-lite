@@ -1,7 +1,7 @@
 /**
  * @file: defines.h
- * @brief: just a file for me keep all the defines in places and easy to get to 
- * 
+ * @brief: just a file for me keep all the defines in places and easy to get to
+ *
  * DATE: 2026-10-26
  */
 #pragma once
