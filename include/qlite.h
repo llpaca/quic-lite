@@ -4914,7 +4914,7 @@ int ql_stream_rx_push(ql_conn_t *conn, ql_stream_t *stream, uint64_t offset, con
                 if (!(stream->rx_received[pos / 8] & (uint8_t)(1u << (pos % 8)))) {
                     break;
                 }
-                stream->rx_received[pos / 8] &= (uint8_t) ~(1u << (pos % 8));
+                stream->rx_received[pos / 8] &= (uint8_t)(~(1u << (pos % 8)));
                 stream->rx_tail++;
             }
         }
