@@ -2546,12 +2546,20 @@ int ql_tp_decode(const uint8_t *buf, size_t len, ql_transport_params_t *out) {
     out->max_ack_delay_ms     = QL_DEFAULT_MAX_ACK_DELAY_MS;
     out->active_cid_limit     = QL_DEFAULT_ACTIVE_CID_LIMIT;
 
-    size_t pos = 0;
+    size_t pos       = 0;
+    uint32_t id_mask = 0;
+
     while (pos < len) {
         ql_varint_t id, tp_len;
         if (ql__read_varint(buf, &pos, len, &id) < 0) {
             return QLITE_ERR_PROTO;
         }
+        // we will bit mask the id to the id_mask and if any duplicated throw errors
+        if (id_mask & (1 << id)) {
+            return QLITE_ERR_PROTO;
+        }
+        id_mask |= (1U << id);
+
         if (ql__read_varint(buf, &pos, len, &tp_len) < 0) {
             return QLITE_ERR_PROTO;
         }
