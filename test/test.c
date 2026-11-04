@@ -59,6 +59,7 @@ int main(void) {
     RUN_TEST(test_tp_cid_fields);
     RUN_TEST(test_tp_buf_too_small);
     RUN_TEST(test_tp_invalid_payload_size);
+    RUN_TEST(test_tp_reject_duplicate_tp_id);
 
     /* udp socket/send/recv */
     RUN_TEST(test_udp_socket_bind_any_ephemeral_port);

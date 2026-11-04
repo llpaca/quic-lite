@@ -141,6 +141,31 @@ TEST(test_tp_invalid_payload_size) {
     EXPECT_LT(m, 0);
 }
 
+TEST(test_tp_reject_duplicate_tp_id) {
+    ql_transport_params_t t;
+
+    /* same id, different values */
+    static const uint8_t dup_diff_value[] = {0x04, 0x01, 0x05, 0x04, 0x01, 0x07};
+    /* same id, same value: still a duplicate */
+    static const uint8_t dup_same_value[] = {0x04, 0x01, 0x05, 0x04, 0x01, 0x05};
+    /* duplicate separated by another parameter */
+    static const uint8_t dup_not_adjacent[] = {0x04, 0x01, 0x05, 0x0A, 0x01,
+                                               0x03, 0x04, 0x01, 0x07};
+    /* duplicate of a parameter that carries no value */
+    static const uint8_t dup_empty_param[] = {0x0C, 0x00, 0x0C, 0x00};
+
+    EXPECT_LT(ql_tp_decode(dup_diff_value, sizeof(dup_diff_value), &t), 0);
+    EXPECT_LT(ql_tp_decode(dup_same_value, sizeof(dup_same_value), &t), 0);
+    EXPECT_LT(ql_tp_decode(dup_not_adjacent, sizeof(dup_not_adjacent), &t), 0);
+    EXPECT_LT(ql_tp_decode(dup_empty_param, sizeof(dup_empty_param), &t), 0);
+
+    /* control: unique ids must still decode */
+    static const uint8_t unique_ids[] = {0x04, 0x01, 0x05, 0x0A, 0x01, 0x03};
+    EXPECT_EQ(ql_tp_decode(unique_ids, sizeof(unique_ids), &t), (int)sizeof(unique_ids));
+    EXPECT_EQ(t.initial_max_data, (uint64_t)5);
+    EXPECT_EQ(t.ack_delay_exponent, (uint64_t)3);
+}
+
 // int main(void){
 
 //     RUN_TEST(test_tp_roundtrip_basic);
