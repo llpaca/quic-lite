@@ -53,28 +53,36 @@ jobs:
           make install_sw
 
   test:
-    needs: build-quictls
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential
-
-      - name: Restore quictls
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.QUICTLS_PREFIX }}
-          key: quictls-${{ env.QUICTLS_REF }}-${{ runner.os }}
-
-      - name: Run unit tests
-        run: |
-          make clean
-          make -j"$(nproc)"
+      name: Unit Tests (${{ matrix.compiler }})
+      needs: build-quictls
+      runs-on: ubuntu-latest
+  
+      strategy:
+        fail-fast: false
+        matrix:
+          compiler: [gcc, clang]
+  
+      steps:
+        - name: Checkout
+          uses: actions/checkout@v4
+  
+        - name: Install toolchain
+          run: |
+            sudo apt-get update
+            sudo apt-get install -y \
+              build-essential \
+              clang
+  
+        - name: Restore quictls
+          uses: actions/cache@v4
+          with:
+            path: ${{ env.QUICTLS_PREFIX }}
+            key: quictls-${{ env.QUICTLS_REF }}-${{ runner.os }}
+  
+        - name: Run unit tests
+          run: |
+            make clean
+            make CC=${{ matrix.compiler }} -j"$(nproc)"
 
   integration:
     needs: build-quictls
