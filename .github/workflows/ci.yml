@@ -1,19 +1,19 @@
+
 name: Test
 
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 env:
-  # TODO: pin this to whatever quictls tag/branch you actually build against
-  # locally (the libssl.so.81.3 SONAME you had suggests a specific release —
-  # check `git -C ~/quictls-install log -1` or wherever you cloned it from).
   QUICTLS_REF: openssl-3.1.4-quic1
-  QUICTLS_PREFIX: /home/runner/quictls-install   # matches $(HOME)/quictls-install in your makefile
+  QUICTLS_PREFIX: /home/runner/quictls-install
 
 jobs:
   build-quictls:
     runs-on: ubuntu-latest
+
     steps:
       - name: Cache quictls build
         id: cache-quictls
@@ -30,25 +30,40 @@ jobs:
           ref: ${{ env.QUICTLS_REF }}
           path: quictls-src
 
+      - name: Install dependencies
+        if: steps.cache-quictls.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            perl \
+            zlib1g-dev
+
       - name: Build quictls
         if: steps.cache-quictls.outputs.cache-hit != 'true'
         run: |
           cd quictls-src
-          ./config --prefix="${{ env.QUICTLS_PREFIX }}" --libdir=lib64
+
+          ./config \
+            --prefix="${{ env.QUICTLS_PREFIX }}" \
+            --libdir=lib64 \
+            shared
+
           make -j"$(nproc)"
           make install_sw
 
   test:
     needs: build-quictls
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install toolchain
         run: |
-          sudo apt update
-          sudo apt install -y build-essential
+          sudo apt-get update
+          sudo apt-get install -y build-essential
 
       - name: Restore quictls
         uses: actions/cache@v4
@@ -56,20 +71,82 @@ jobs:
           path: ${{ env.QUICTLS_PREFIX }}
           key: quictls-${{ env.QUICTLS_REF }}-${{ runner.os }}
 
-      - name: Test
-        run: make
+      - name: Run unit tests
+        run: |
+          make clean
+          make -j"$(nproc)"
+
+  integration:
+    needs: build-quictls
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Restore quictls
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.QUICTLS_PREFIX }}
+          key: quictls-${{ env.QUICTLS_REF }}-${{ runner.os }}
+
+      - name: Build echo example
+        working-directory: examples/echo
+        run: |
+          make clean
+          make -j"$(nproc)"
+
+      - name: Run QUIC integration test
+        working-directory: examples/echo
+        timeout-minutes: 1
+        run: |
+          ./server 4433 > server.log 2>&1 &
+          SERVER_PID=$!
+
+          cleanup() {
+            kill -INT "$SERVER_PID" 2>/dev/null || true
+            wait "$SERVER_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          sleep 1
+
+          timeout 15s ./client \
+            127.0.0.1 \
+            4433 \
+            "ci integration test" > client.log 2>&1
+
+          cat client.log
+          grep -Fq "ci integration test" client.log
+
+      - name: Show logs on failure
+        if: failure()
+        working-directory: examples/echo
+        run: |
+          cat server.log || true
+          cat client.log || true
 
   lint:
     needs: build-quictls
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install toolchain
         run: |
-          sudo apt update
-          sudo apt install -y clang-tidy clang-format
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            clang-tidy \
+            clang-format
 
       - name: Restore quictls
         uses: actions/cache@v4
@@ -77,12 +154,11 @@ jobs:
           path: ${{ env.QUICTLS_PREFIX }}
           key: quictls-${{ env.QUICTLS_REF }}-${{ runner.os }}
 
-      - name: clang-format check
-        run: |
-          find include src test \( -name '*.h' -o -name '*.c' \) -print0 \
-            | xargs -0 clang-format --dry-run --Werror
+      - name: Run project lint
+        run: make lint
 
-      - name: clang-tidy static analysis
+      - name: Check example formatting
         run: |
-          clang-tidy include/qlite.h -- \
-            -std=c11 -Iinclude -I"${{ env.QUICTLS_PREFIX }}/include"
+          find examples \
+            \( -name '*.h' -o -name '*.c' \) -print0 \
+            | xargs -0 -r clang-format --dry-run --Werror
